@@ -59,14 +59,15 @@ end
 
 assert('s2n: a loopback handshake completes, single-threaded, stepped') do
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
-  scfg.policy = '20190214'  # TLS 1.2 incl. ECDSA-GCM: the kTLS-ready lane
   ccfg = KTLS::Config.client
-  ccfg.policy = '20190214'
   speer, cpeer = ktls_loopback_pair
   begin
     sconn = KTLS::Connection.new(scfg, speer, :server)
     cconn = KTLS::Connection.new(ccfg, cpeer, :client)
     assert_true ktls_handshake(sconn, cconn), 'handshake never completed'
+    # TLS 1.3 is mandatory: the default policy's minimum enforces it.
+    assert_equal :tls13, sconn.version
+    assert_equal :tls13, cconn.version
     # Application data through s2n, pre-handover.
     n, = cconn.send('hello over tls')
     assert_equal 14, n
@@ -86,9 +87,7 @@ end
 assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
   skip 'kTLS not available on this host' unless KTLS.supported?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
-  scfg.policy = '20190214'
   ccfg = KTLS::Config.client
-  ccfg.policy = '20190214'
   speer, cpeer = ktls_loopback_pair
   begin
     sconn = KTLS::Connection.new(scfg, speer, :server)

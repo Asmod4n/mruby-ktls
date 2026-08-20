@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -132,6 +133,24 @@ ktls_config_free(mrb_state *mrb, void *p)
 
 static const struct mrb_data_type ktls_config_type = {"KTLS::Config", ktls_config_free};
 
+/* TLS 1.3 is MANDATORY here: the default policy's minimum is 1.3.
+ * The price is named by s2n itself - ktls_enable_unsafe_tls13: once
+ * the kernel holds the keys, KeyUpdate cannot be processed; a peer
+ * that sends one ends the connection. A server never sends KeyUpdate,
+ * so for a server posture that is a clean trade, made visibly. */
+static void
+ktls_config_common(mrb_state *mrb, struct ktls_config *c)
+{
+  c->cfg = s2n_config_new_minimal();
+  if (c->cfg == NULL) ktls_s2n_raise(mrb, "s2n_config_new_minimal");
+  if (s2n_config_set_cipher_preferences(c->cfg, "AWS-CRT-SDK-TLSv1.3") != S2N_SUCCESS) {
+    ktls_s2n_raise(mrb, "set_cipher_preferences");
+  }
+  if (s2n_config_ktls_enable_unsafe_tls13(c->cfg) != S2N_SUCCESS) {
+    ktls_s2n_raise(mrb, "ktls_enable_unsafe_tls13");
+  }
+}
+
 /* KTLS::Config.server(cert_pem, key_pem) */
 static mrb_value
 ktls_config_server(mrb_state *mrb, mrb_value klass)
@@ -144,8 +163,7 @@ ktls_config_server(mrb_state *mrb, mrb_value klass)
   struct RData *data =
       mrb_data_object_alloc(mrb, mrb_class_ptr(klass), c, &ktls_config_type);
 
-  c->cfg = s2n_config_new_minimal();
-  if (c->cfg == NULL) ktls_s2n_raise(mrb, "s2n_config_new_minimal");
+  ktls_config_common(mrb, c);
   c->chain = s2n_cert_chain_and_key_new();
   if (c->chain == NULL) ktls_s2n_raise(mrb, "s2n_cert_chain_and_key_new");
   if (s2n_cert_chain_and_key_load_pem_bytes(c->chain, (uint8_t *)cert, (uint32_t)certlen,
@@ -167,17 +185,16 @@ ktls_config_client(mrb_state *mrb, mrb_value klass)
   struct ktls_config *c = (struct ktls_config *)mrb_calloc(mrb, 1, sizeof(*c));
   struct RData *data =
       mrb_data_object_alloc(mrb, mrb_class_ptr(klass), c, &ktls_config_type);
-  c->cfg = s2n_config_new_minimal();
-  if (c->cfg == NULL) ktls_s2n_raise(mrb, "s2n_config_new_minimal");
+  ktls_config_common(mrb, c);
   if (s2n_config_disable_x509_verification(c->cfg) != S2N_SUCCESS) {
     ktls_s2n_raise(mrb, "disable_x509_verification");
   }
   return mrb_obj_value(data);
 }
 
-/* config.policy = "20170210" - an s2n security-policy name. The kTLS
- * path wants a TLS 1.2 AES-GCM policy until the 1.3 key-update story
- * is settled (s2n calls its own flag "unsafe_tls13" for a reason). */
+/* config.policy = "..." - an s2n security-policy name, overriding the
+ * default. The default REQUIRES TLS 1.3 (AWS-CRT-SDK-TLSv1.3); pick a
+ * weaker lane only knowing why. */
 static mrb_value
 ktls_config_policy_set(mrb_state *mrb, mrb_value self)
 {
@@ -238,6 +255,13 @@ ktls_conn_init(mrb_state *mrb, mrb_value self)
   const int fd = ktls_fileno(mrb, io);
   const int fl = fcntl(fd, F_GETFL, 0);
   if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) mrb_sys_fail(mrb, "O_NONBLOCK");
+  /* Nagle holds the second of s2n's CCS+Finished writes hostage to a
+   * delayed ACK - found as a live stall: a nonblocking stepper spins
+   * its budget away in microseconds while 58 bytes sit in the kernel
+   * for 40ms. Handshake messages are latency traffic; NODELAY is the
+   * correct posture and best-effort (non-TCP fds refuse, fine). */
+  const int one = 1;
+  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   if (s2n_connection_set_fd(c->conn, fd) != S2N_SUCCESS) ktls_s2n_raise(mrb, "set_fd");
   /* The config must outlive the connection; s2n holds a pointer. */
   mrb_iv_set(mrb, self, MRB_IVSYM(config), cfgv);
@@ -268,6 +292,20 @@ ktls_conn_negotiate(mrb_state *mrb, mrb_value self)
     }
   }
   return ktls_blocked_sym(mrb, blocked);
+}
+
+/* conn.version -> :tls13 (or what else was negotiated). */
+static mrb_value
+ktls_conn_version(mrb_state *mrb, mrb_value self)
+{
+  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
+  switch (s2n_connection_get_actual_protocol_version(c->conn)) {
+    case S2N_TLS13: return mrb_symbol_value(MRB_SYM(tls13));
+    case S2N_TLS12: return mrb_symbol_value(MRB_SYM(tls12));
+    case S2N_TLS11: return mrb_symbol_value(MRB_SYM(tls11));
+    case S2N_TLS10: return mrb_symbol_value(MRB_SYM(tls10));
+    default: return mrb_nil_value();
+  }
 }
 
 /* conn.ktls_send! / conn.ktls_recv! - the handover. After both, the
@@ -362,6 +400,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   MRB_SET_INSTANCE_TT(cn, MRB_TT_DATA);
   mrb_define_method_id(mrb, cn, MRB_SYM(initialize), ktls_conn_init, MRB_ARGS_REQ(3));
   mrb_define_method_id(mrb, cn, MRB_SYM(negotiate), ktls_conn_negotiate, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, cn, MRB_SYM(version), ktls_conn_version, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(send), ktls_conn_send, MRB_ARGS_REQ(1));

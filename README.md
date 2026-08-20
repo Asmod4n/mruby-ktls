@@ -19,7 +19,8 @@ and both ends of a handshake can be driven from a single thread.
 
 ```ruby
 scfg = KTLS::Config.server(cert_pem, key_pem)
-scfg.policy = '20190214'          # a TLS 1.2 lane; kTLS-ready
+# TLS 1.3 is MANDATORY by default (policy AWS-CRT-SDK-TLSv1.3,
+# minimum 1.3); #policy= overrides, knowing why.
 
 conn = KTLS::Connection.new(scfg, sock, :server)
 loop do
@@ -48,9 +49,16 @@ guessing from versions) and `KTLS.ulp(io)` attaching the ULP raw.
   is for loopback tests and pinned deployments that verify
   themselves). A trust-store API is the next slab; nothing here
   pretends to be one.
-- TLS 1.3 kTLS is not wired: s2n calls its own flag
-  `ktls_enable_unsafe_tls13` for a reason (key updates). The 1.2
-  AES-GCM lane is the kTLS lane until that story settles.
+- TLS 1.3 is mandatory and the kTLS handover uses s2n's
+  `ktls_enable_unsafe_tls13`. The price is named by s2n itself: once
+  the kernel holds the keys, KeyUpdate cannot be processed - a peer
+  that sends one ends the connection. A server never sends KeyUpdate;
+  for a server posture that is a clean trade, made visibly.
+- `Connection.new` sets `TCP_NODELAY` (best-effort): Nagle holds the
+  second of s2n's CCS+Finished writes hostage to a delayed ACK, and a
+  nonblocking stepper spins its budget away in microseconds while 58
+  bytes sit in the kernel for 40ms. Found as a live stall, kept as a
+  sentence.
 - Why kTLS at all, measured on the old tree: throughput parity with
   userspace TLS, RSS is the win, and splice into a kTLS socket works -
   file bodies never touch userspace.
