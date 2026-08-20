@@ -134,10 +134,26 @@ ktls_config_free(mrb_state *mrb, void *p)
 static const struct mrb_data_type ktls_config_type = {"KTLS::Config", ktls_config_free};
 
 /* TLS 1.3 is MANDATORY here: the default policy's minimum is 1.3.
- * The price is named by s2n itself - ktls_enable_unsafe_tls13: once
- * the kernel holds the keys, KeyUpdate cannot be processed; a peer
- * that sends one ends the connection. A server never sends KeyUpdate,
- * so for a server posture that is a clean trade, made visibly. */
+ *
+ * The 1.3 kTLS handover exists in s2n only behind
+ * s2n_config_ktls_enable_unsafe_tls13 - and that call is the whole
+ * KeyUpdate machinery, not its absence: s2n CAN send a KeyUpdate
+ * through the offloaded socket (TLS_HANDSHAKE cmsg, re-derive,
+ * re-setsockopt TLS_TX) and process a received one (re-setsockopt
+ * TLS_RX). "unsafe" labels three caveats, all about raw-fd use, and
+ * THIS LAYER'S EMBEDDER OWNS THEM NOW - decided knowingly:
+ *
+ *   1. The AES-GCM encryption limit (2^24.5 full records ~ 388GB per
+ *      direction per key) is only accounted for traffic through
+ *      s2n_send. Raw fd writes escape the count: the embedder caps
+ *      bytes per connection below the limit (or prefers
+ *      CHACHA20-POLY1305, which has no practical one) - see
+ *      Connection#cipher.
+ *   2. An incoming KeyUpdate surfaces on a raw read() as EIO, not as
+ *      data. The embedder treats that as the end of the connection
+ *      (errors kill the connection, never the process).
+ *   3. Re-keying via a second setsockopt needs kernel >= 6.14.
+ */
 static void
 ktls_config_common(mrb_state *mrb, struct ktls_config *c)
 {
@@ -308,6 +324,19 @@ ktls_conn_version(mrb_state *mrb, mrb_value self)
   }
 }
 
+/* conn.cipher -> the negotiated cipher's IANA name. The caller needs
+ * it to know which encryption limit applies to raw-fd sends after the
+ * handover: AES-GCM ~388GB per direction per key, CHACHA20-POLY1305
+ * practically none. */
+static mrb_value
+ktls_conn_cipher(mrb_state *mrb, mrb_value self)
+{
+  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
+  const char *name = s2n_connection_get_cipher(c->conn);
+  if (name == NULL) return mrb_nil_value();
+  return mrb_str_new_cstr(mrb, name);
+}
+
 /* conn.ktls_send! / conn.ktls_recv! - the handover. After both, the
  * fd's plain send/recv are TLS and s2n is out of the data path. */
 static mrb_value
@@ -401,6 +430,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   mrb_define_method_id(mrb, cn, MRB_SYM(initialize), ktls_conn_init, MRB_ARGS_REQ(3));
   mrb_define_method_id(mrb, cn, MRB_SYM(negotiate), ktls_conn_negotiate, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(version), ktls_conn_version, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, cn, MRB_SYM(cipher), ktls_conn_cipher, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(send), ktls_conn_send, MRB_ARGS_REQ(1));

@@ -68,6 +68,10 @@ assert('s2n: a loopback handshake completes, single-threaded, stepped') do
     # TLS 1.3 is mandatory: the default policy's minimum enforces it.
     assert_equal :tls13, sconn.version
     assert_equal :tls13, cconn.version
+    # The cipher name tells the embedder which encryption limit its
+    # raw-fd sends live under after a kTLS handover.
+    assert_true sconn.cipher.is_a?(String) && sconn.cipher.include?('TLS_'),
+                "unexpected cipher: #{sconn.cipher.inspect}"
     # Application data through s2n, pre-handover.
     n, = cconn.send('hello over tls')
     assert_equal 14, n

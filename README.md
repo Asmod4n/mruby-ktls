@@ -49,11 +49,19 @@ guessing from versions) and `KTLS.ulp(io)` attaching the ULP raw.
   is for loopback tests and pinned deployments that verify
   themselves). A trust-store API is the next slab; nothing here
   pretends to be one.
-- TLS 1.3 is mandatory and the kTLS handover uses s2n's
-  `ktls_enable_unsafe_tls13`. The price is named by s2n itself: once
-  the kernel holds the keys, KeyUpdate cannot be processed - a peer
-  that sends one ends the connection. A server never sends KeyUpdate;
-  for a server posture that is a clean trade, made visibly.
+- TLS 1.3 is mandatory, and s2n's ONLY 1.3 handover path is
+  `s2n_config_ktls_enable_unsafe_tls13`. That call is not the absence
+  of KeyUpdate support - it IS s2n's KeyUpdate-over-kTLS machinery
+  (send a KeyUpdate through the offloaded socket and re-setsockopt
+  TLS_TX; process a received one and re-setsockopt TLS_RX). "unsafe"
+  labels three caveats, all about raw-fd use, and the embedder owns
+  them here - decided knowingly:
+
+  | Caveat | Owner's duty |
+  |---|---|
+  | AES-GCM key limit (~388GB/direction) counted only for s2n_send traffic | Cap bytes per connection below the limit, or prefer CHACHA20-POLY1305 (`Connection#cipher` says which applies) |
+  | Incoming KeyUpdate = EIO on a raw read | Treat as end of connection (errors kill the connection, never the process) |
+  | Re-key needs a second setsockopt | Kernel >= 6.14 |
 - `Connection.new` sets `TCP_NODELAY` (best-effort): Nagle holds the
   second of s2n's CCS+Finished writes hostage to a delayed ACK, and a
   nonblocking stepper spins its budget away in microseconds while 58
