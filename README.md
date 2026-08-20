@@ -55,6 +55,17 @@ guessing from versions) and `KTLS.ulp(io)` attaching the ULP raw.
   userspace TLS, RSS is the win, and splice into a kTLS socket works -
   file bodies never touch userspace.
 
+## Not AF_ALG
+
+kTLS is often confused with the kernel's OTHER crypto interface.
+AF_ALG (`CONFIG_CRYPTO_USER_API`) is the generic crypto socket API -
+deprecated for Linux 7.2 after a steady CVE stream ("Copy Fail",
+CVE-2026-31431, sat in `algif_aead`), and already disabled by
+distributions. kTLS is the TLS ULP (`CONFIG_TLS`), a separate
+subsystem that calls kernel crypto internally and takes no AF_ALG
+detour. `CRYPTO_USER_API=n` with `CONFIG_TLS=y` is exactly the
+intended pairing: their door closed, this one open.
+
 ## Requirements
 
 Linux with `CONFIG_TLS` for the handover (probed at runtime, never
