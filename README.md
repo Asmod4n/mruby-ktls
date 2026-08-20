@@ -24,20 +24,18 @@ three caveats from the table below dissolve here by construction.
 
 ```ruby
 tls = KTLS::Socket.attach(sock, config, :server)  # adopts a dup of the fd
-tls.handshake                  # blocking convenience; steps, then
-                               # try_enable if available?
-tls.write("hello")             # kernel-encrypted when available?
+tls.handshake                  # blocking convenience; steps, then hands
+                               # over where KTLS.enabled?
+tls.write("hello")             # kernel-encrypted when KTLS.enabled?
 line = tls.recv(4096)
 tls.close                      # close_notify, then the fd
 ```
 
-The kTLS surface is THREE methods, whole: `KTLS.enabled?` (is the
-tls subsystem initialized on this host? passive, loads nothing),
-`Socket#available?` (the same question, asked at the socket), and
-`Socket#try_enable` (the handover; raises when it cannot). No state
+The kTLS capability surface lives whole on the module - THREE
+methods (see "Nothing loads automatically"): `KTLS.enabled?`,
+`KTLS.available?`, `KTLS.try_enable`. The socket keeps no state
 mirror: s2n itself knows whether it is offloaded and routes
-accordingly - the API stays identical either way. A caller who wants
-the shrug writes `tls.try_enable if tls.available?`.
+accordingly - the API stays identical either way.
 
 Reactors use `#handshake_step` (or `KTLS::Connection` directly) and
 keep the raw-fd escape - with its duties.
@@ -70,30 +68,37 @@ sock.write(bytes)  # a plain write IS a TLS record from here on
 `KTLS::Connection#send/#recv` speak through s2n for whatever runs
 before - or without - the handover.
 
-Needing no keys and no s2n: `KTLS.enabled?` (passive - see below)
-and `KTLS.ulp(io)` attaching the ULP raw.
+Needing no keys and no s2n: the three capability methods below, and
+`KTLS.ulp(io)` attaching the ULP raw.
 
 ## Nothing loads automatically
 
 Setting `TCP_ULP` to `"tls"` makes the kernel **autoload** the `tls`
 module on hosts that ship it as one. A library must never change
-kernel state because someone asked a question - so this gem splits
-asking from loading:
+kernel state because someone asked a question - so the capability
+surface is three module methods, and only the third changes
+anything:
 
-- `KTLS.enabled?` / `Socket#available?` are **passive**: they read
-  the `/proc/net/tls_stat` marker, which exists exactly when the tls
-  subsystem is initialized (module loaded, or built in). No socket,
-  no setsockopt, no module load - asking never changes the answer.
-- `KTLS.probe` is the ONE deliberate loader: it does the thing (a
-  loopback TCP pair, `TCP_ULP` set to `"tls"`) and MAY autoload the
-  module. Call it - or `modprobe tls` - on purpose, once, at a place
-  you chose.
-- Every path that would trigger the autoload as a side effect -
-  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv`,
-  `Socket#try_enable` - refuses by name when the subsystem is not
-  initialized ("kTLS is not
+- `KTLS.enabled?` - loaded AND active right now? Passive: reads the
+  `/proc/net/tls_stat` marker, which exists exactly when the tls
+  subsystem is initialized (module loaded, or built in). Asking
+  never changes the answer.
+- `KTLS.available?` - does THIS kernel ship the functionality,
+  loaded or not? Passive too: enabled counts, else the running
+  kernel's module index must list `net/tls/tls.ko` (`modules.dep` /
+  `modules.builtin`). False means `try_enable` cannot help.
+- `KTLS.try_enable` - the ONE deliberate loader: one `setsockopt`
+  on a dummy socket. The ULP lookup autoloads the module BEFORE the
+  ULP inspects the socket, and refusing the unconnected dummy
+  (ENOTCONN) is the success sound - the module is loaded, nothing
+  was touched but that. Raises with errno when the kernel cannot
+  (ENOENT: no tls ULP, no module to load). `modprobe tls` outside
+  the process works just as well.
+- Everything that would trigger the autoload as a side effect -
+  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv` - refuses by
+  name when the subsystem is not initialized ("kTLS is not
   initialized (tls module not loaded) - load it deliberately:
-  modprobe tls, or KTLS.probe") instead of loading it for you.
+  modprobe tls, or KTLS.try_enable") instead of loading it for you.
 
 ## Scope lines
 

@@ -31,6 +31,12 @@ module KTLS
       @ktls.negotiate
     end
 
+    # Blocking convenience: steps to :done, then hands the record
+    # layer to the kernel where it is active (KTLS.enabled? - the
+    # capability surface lives whole on the KTLS module: enabled? /
+    # available? / try_enable). No state mirror here: s2n itself
+    # knows whether it is offloaded and routes accordingly - the API
+    # below is identical either way.
     def handshake
       loop do
         case handshake_step
@@ -39,30 +45,10 @@ module KTLS
         else IO.select([self])
         end
       end
-      try_enable if available?
-      self
-    end
-
-    # The kTLS surface is THREE methods, whole:
-    #   KTLS.enabled?  - is the tls subsystem initialized on this
-    #                    host? Passive (/proc marker), loads nothing.
-    #   #available?    - the same question, asked at the socket.
-    #   #try_enable    - the handover; raises when it cannot.
-    # No state mirror: s2n itself knows whether it is offloaded and
-    # routes accordingly - the API above is identical either way.
-
-    def available?
-      KTLS.enabled?
-    end
-
-    # Hands the record layer to the kernel and RAISES when it cannot:
-    # the "not initialized" refusal (load the tls module deliberately
-    # - modprobe tls, or KTLS.probe) and s2n's own errors pass
-    # through untouched. If it returns, the kernel owns the wire; a
-    # caller who wants the shrug writes `try_enable if available?`.
-    def try_enable
-      @ktls.enable_ktls_send
-      @ktls.enable_ktls_recv
+      if KTLS.enabled?
+        @ktls.enable_ktls_send
+        @ktls.enable_ktls_recv
+      end
       self
     end
 

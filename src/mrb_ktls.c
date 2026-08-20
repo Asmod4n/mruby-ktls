@@ -11,8 +11,9 @@
  * steps (:done / :reading / :writing, never sleeps - self-service
  * blinding), the fd is switched to O_NONBLOCK at attach.
  *
- * KTLS.enabled? / KTLS.ulp need no keys and no s2n; one reads a /proc
- * marker, one attaches the tls ULP directly (see below).
+ * KTLS.enabled? / KTLS.available? / KTLS.try_enable / KTLS.ulp need
+ * no keys and no s2n: two passive questions, one deliberate loader,
+ * one raw ULP attach (see below).
  */
 #include <mruby.h>
 #include <mruby/array.h>
@@ -29,9 +30,11 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <s2n.h>
@@ -60,11 +63,20 @@ ktls_set_ulp(int fd)
   return setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls"));
 }
 
-/* Asking must never LOAD: setsockopt(TCP_ULP, "tls") autoloads the
+/* The capability surface is THREE module questions/acts, and only
+ * try_enable changes anything:
+ *
+ *   KTLS.enabled?    - loaded AND active right now?
+ *   KTLS.available?  - does THIS kernel ship the functionality?
+ *   KTLS.try_enable  - one setsockopt on a dummy socket: the ONE
+ *                      deliberate loader; raises when it cannot.
+ *
+ * Asking must never LOAD: setsockopt(TCP_ULP, "tls") autoloads the
  * tls module, and a capability question has no business changing
- * kernel state. /proc/net/tls_stat exists exactly when tls is
- * initialized - as a module already loaded, or built in - so the
- * passive answer is "usable right now, nothing touched". */
+ * kernel state - so both questions are filesystem reads. */
+
+/* /proc/net/tls_stat exists exactly when tls is initialized - as a
+ * module already loaded, or built in: "usable right now". */
 static int
 ktls_initialized(void)
 {
@@ -77,40 +89,89 @@ ktls_enabled_p(mrb_state *mrb, mrb_value self)
   return mrb_bool_value(ktls_initialized());
 }
 
-/* KTLS.probe - the ONE deliberate loader: does the thing (a loopback
- * pair, ULP on the connected end - TCP_ULP demands an ESTABLISHED
- * socket, nothing cheaper answers honestly) and MAY autoload the tls
- * module doing so. Operators who forbid module loading simply never
- * call it; everything else in this gem stays passive. */
-static mrb_value
-ktls_probe(mrb_state *mrb, mrb_value self)
+/* memmem is a GNU extension; this is its portable little sibling. */
+static int
+ktls_memfind(const char *hay, size_t hlen, const char *pat, size_t plen)
 {
-  mrb_bool ok = FALSE;
-  int ls = -1, a = -1, c = -1;
-  struct sockaddr_in sa;
-  socklen_t slen = sizeof(sa);
+  if (hlen < plen) return 0;
+  for (size_t i = 0; i <= hlen - plen; i++) {
+    if (hay[i] == pat[0] && memcmp(hay + i, pat, plen) == 0) return 1;
+  }
+  return 0;
+}
 
-  memset(&sa, 0, sizeof(sa));
-  sa.sin_family = AF_INET;
-  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+/* Rolling substring search over a file: the pattern may straddle a
+ * read boundary, so each round keeps the last strlen(pat)-1 bytes. */
+static int
+ktls_file_contains(const char *path, const char *pat)
+{
+  const size_t plen = strlen(pat);
+  char buf[4096];
+  size_t held = 0;
+  int found = 0;
 
-  ls = socket(AF_INET, SOCK_STREAM, 0);
-  if (ls < 0) goto out;
-  if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) != 0) goto out;
-  if (getsockname(ls, (struct sockaddr *)&sa, &slen) != 0) goto out;
-  if (listen(ls, 1) != 0) goto out;
-  c = socket(AF_INET, SOCK_STREAM, 0);
-  if (c < 0) goto out;
-  if (connect(c, (struct sockaddr *)&sa, sizeof(sa)) != 0) goto out;
-  a = accept(ls, NULL, NULL);
-  if (a < 0) goto out;
-  ok = ktls_set_ulp(c) == 0;
+  const int fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  for (;;) {
+    const ssize_t n = read(fd, buf + held, sizeof(buf) - held);
+    if (n <= 0) break;
+    const size_t have = held + (size_t)n;
+    if (ktls_memfind(buf, have, pat, plen)) {
+      found = 1;
+      break;
+    }
+    held = plen - 1 < have ? plen - 1 : have;
+    memmove(buf, buf + (have - held), held);
+  }
+  close(fd);
+  return found;
+}
 
-out:
-  if (a >= 0) close(a);
-  if (c >= 0) close(c);
-  if (ls >= 0) close(ls);
-  return mrb_bool_value(ok);
+/* KTLS.available? - does this kernel SHIP kTLS, loaded or not?
+ * Passive: already initialized counts, else the running kernel's
+ * module index must list net/tls/tls.ko (modules.dep for loadable,
+ * modules.builtin for compiled-in; the substring also matches
+ * compressed spellings like tls.ko.xz). A modul-less kernel without
+ * CONFIG_TLS has neither - false, and try_enable cannot help. */
+static int
+ktls_module_shipped(void)
+{
+  struct utsname u;
+  char path[sizeof(u.release) + 64];
+
+  if (uname(&u) != 0) return 0;
+  snprintf(path, sizeof(path), "/lib/modules/%s/modules.dep", u.release);
+  if (ktls_file_contains(path, "net/tls/tls.ko")) return 1;
+  snprintf(path, sizeof(path), "/lib/modules/%s/modules.builtin", u.release);
+  return ktls_file_contains(path, "net/tls/tls.ko");
+}
+
+static mrb_value
+ktls_available_p(mrb_state *mrb, mrb_value self)
+{
+  return mrb_bool_value(ktls_initialized() || ktls_module_shipped());
+}
+
+/* KTLS.try_enable - the ONE deliberate loader: one setsockopt on a
+ * dummy socket. The ULP lookup autoloads the tls module BEFORE the
+ * ULP's init runs, and that init refuses a socket that is not
+ * ESTABLISHED - so on a dummy socket ENOTCONN is the success sound:
+ * the ULP was found, the module is loaded, only the socket's state
+ * was refused. Anything else (ENOENT: this kernel has no tls ULP and
+ * autoload found no module) raises with errno. */
+static mrb_value
+ktls_try_enable(mrb_state *mrb, mrb_value self)
+{
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) mrb_sys_fail(mrb, "socket");
+  const int rc = ktls_set_ulp(fd);
+  const int e = errno;
+  close(fd);
+  if (rc != 0 && e != ENOTCONN) {
+    errno = e;
+    mrb_sys_fail(mrb, "setsockopt(TCP_ULP, \"tls\")");
+  }
+  return mrb_true_value();
 }
 
 static mrb_value
@@ -121,7 +182,7 @@ ktls_ulp(mrb_state *mrb, mrb_value self)
   if (!ktls_initialized()) {
     mrb_raise(mrb, E_RUNTIME_ERROR,
               "kTLS is not initialized (tls module not loaded) - load it "
-              "deliberately: modprobe tls, or KTLS.probe");
+              "deliberately: modprobe tls, or KTLS.try_enable");
   }
   if (ktls_set_ulp(ktls_fileno(mrb, io)) != 0) {
     mrb_sys_fail(mrb, "setsockopt(TCP_ULP, \"tls\")");
@@ -397,7 +458,7 @@ ktls_require_initialized(mrb_state *mrb)
   if (!ktls_initialized()) {
     mrb_raise(mrb, E_RUNTIME_ERROR,
               "kTLS is not initialized (tls module not loaded) - load it "
-              "deliberately: modprobe tls, or KTLS.probe");
+              "deliberately: modprobe tls, or KTLS.try_enable");
   }
 }
 
@@ -479,7 +540,10 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
   mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
                                 MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_probe, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(available), ktls_available_p,
+                                MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(try_enable), ktls_try_enable,
+                                MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_ulp, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, m, MRB_SYM(dup_fd), ktls_dup_fd, MRB_ARGS_REQ(1));
 
@@ -530,7 +594,9 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
   mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
                                 MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_notimp, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(available), ktls_enabled_p,
+                                MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(try_enable), ktls_notimp, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_notimp, MRB_ARGS_REQ(1));
 }
 

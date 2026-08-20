@@ -31,6 +31,28 @@ assert('KTLS.enabled? answers a boolean, passively - asking loads nothing') do
   assert_equal v, KTLS.enabled?
 end
 
+assert('KTLS.available? answers whether this kernel ships kTLS - passively') do
+  v = KTLS.available?
+  assert_true v == true || v == false
+  assert_equal v, KTLS.available?
+  # Active implies shipped: enabled? can never outrun available?.
+  assert_true KTLS.available? if KTLS.enabled?
+end
+
+assert('KTLS.try_enable: the ONE deliberate loader, loud when it cannot') do
+  if KTLS.available?
+    # A kernel that ships the functionality lets the deliberate act
+    # succeed - and the passive answer flips to active.
+    assert_true KTLS.try_enable
+    assert_true KTLS.enabled?
+  else
+    # A kernel without it refuses with errno - and asking afterwards
+    # still says no: nothing was half-loaded.
+    assert_raise(SystemCallError) { KTLS.try_enable }
+    assert_false KTLS.enabled?
+  end
+end
+
 assert('KTLS.ulp refuses a socket that is not ESTABLISHED, with errno') do
   skip 'kTLS not available on this host' unless KTLS.enabled?
   sock = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM)
@@ -107,13 +129,9 @@ assert('KTLS::Socket: the inherited socket API, TLS underneath') do
   end
   assert_equal :done, st
   assert_equal :done, ct
-  # Hand over where the host allows it - the guarded spelling of the
-  # shrug; the API is identical either way (s2n routes through the
-  # offloaded socket when it is offloaded).
-  if s.available?
-    s.try_enable
-    c.try_enable
-  end
+  # No handover here: #handshake does it where KTLS.enabled?; the
+  # API is identical either way (s2n routes through the offloaded
+  # socket when offloaded, does the crypto itself when not).
   assert_equal :tls13, s.version
   assert_equal 14, c.write('hello over tls')
   got = ''
@@ -148,49 +166,12 @@ assert('handover paths refuse by name instead of autoloading the module') do
     assert_true err != nil, 'enable_ktls_send did not refuse'
     assert_true err.message.include?('not initialized'),
                 "unexpected refusal: #{err.message.inspect}"
-    assert_true err.message.include?('KTLS.probe'),
+    assert_true err.message.include?('KTLS.try_enable'),
                 'refusal must name the deliberate loader'
   ensure
     speer.close
     cpeer.close
   end
-end
-
-assert('KTLS::Socket#try_enable raises; #available? saw it coming') do
-  skip 'tls subsystem initialized on this host' if KTLS.enabled?
-  scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
-  ccfg = KTLS::Config.client
-  speer, cpeer = ktls_loopback_pair
-  s = KTLS::Socket.attach(speer, scfg, :server)
-  c = KTLS::Socket.attach(cpeer, ccfg, :client)
-  speer.close
-  cpeer.close
-  st = ct = :reading
-  200.times do
-    st = s.handshake_step unless st == :done
-    ct = c.handshake_step unless ct == :done
-    break if st == :done && ct == :done
-  end
-  assert_equal :done, st
-  # The question agrees with what the attempt is about to say.
-  assert_false s.available?
-  # The attempt: loud, and it names the way out.
-  err = nil
-  begin
-    s.try_enable
-  rescue RuntimeError => e
-    err = e
-  end
-  assert_true err != nil, 'try_enable did not raise'
-  assert_true err.message.include?('not initialized'),
-              "unexpected error: #{err.message.inspect}"
-  # Refusing did not poison the connection: data still flows via s2n.
-  assert_equal 5, c.write('still')
-  got = ''
-  got << s.recv(16) while got.bytesize < 5
-  assert_equal 'still', got
-  c.close
-  s.close
 end
 
 assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
