@@ -22,7 +22,6 @@ module KTLS
 
     def _ktls_init(config, mode)
       @ktls = Connection.new(config, self, mode)
-      @offloaded = false
       self
     end
 
@@ -40,43 +39,31 @@ module KTLS
         else IO.select([self])
         end
       end
-      offload
+      try_enable if available?
       self
+    end
+
+    # The kTLS surface is THREE methods, whole:
+    #   KTLS.enabled?  - is the tls subsystem initialized on this
+    #                    host? Passive (/proc marker), loads nothing.
+    #   #available?    - the same question, asked at the socket.
+    #   #try_enable    - the handover; raises when it cannot.
+    # No state mirror: s2n itself knows whether it is offloaded and
+    # routes accordingly - the API above is identical either way.
+
+    def available?
+      KTLS.enabled?
     end
 
     # Hands the record layer to the kernel and RAISES when it cannot:
     # the "not initialized" refusal (load the tls module deliberately
     # - modprobe tls, or KTLS.probe) and s2n's own errors pass
-    # through untouched. For callers whose deployment PROMISES kTLS
-    # and who want the broken promise loud, not a false.
+    # through untouched. If it returns, the kernel owns the wire; a
+    # caller who wants the shrug writes `try_enable if available?`.
     def try_enable
       @ktls.enable_ktls_send
       @ktls.enable_ktls_recv
-      @offloaded = true
       self
-    end
-
-    # The shrugging sibling: same handover, but a host that cannot
-    # take it answers false and s2n keeps doing the crypto itself -
-    # the API above stays identical either way (s2n routes sends
-    # through the offloaded socket when it is offloaded). True = the
-    # kernel owns the wire.
-    def offload
-      try_enable
-      true
-    rescue RuntimeError
-      @offloaded = false
-    end
-
-    def offloaded?
-      @offloaded
-    end
-
-    # The public question: can THIS host hand the record layer to the
-    # kernel? PASSIVE (see KTLS.supported?): reads a /proc marker and
-    # never loads the tls module. KTLS.probe is the deliberate loader.
-    def ktls_available?
-      KTLS.supported?
     end
 
     def version = @ktls.version

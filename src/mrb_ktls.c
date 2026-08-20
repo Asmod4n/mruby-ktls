@@ -11,8 +11,8 @@
  * steps (:done / :reading / :writing, never sleeps - self-service
  * blinding), the fd is switched to O_NONBLOCK at attach.
  *
- * KTLS.supported? / KTLS.ulp need no keys and no s2n; they probe and
- * attach the tls ULP directly (see below).
+ * KTLS.enabled? / KTLS.ulp need no keys and no s2n; one reads a /proc
+ * marker, one attaches the tls ULP directly (see below).
  */
 #include <mruby.h>
 #include <mruby/array.h>
@@ -72,7 +72,7 @@ ktls_initialized(void)
 }
 
 static mrb_value
-ktls_supported_p(mrb_state *mrb, mrb_value self)
+ktls_enabled_p(mrb_state *mrb, mrb_value self)
 {
   return mrb_bool_value(ktls_initialized());
 }
@@ -477,7 +477,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   }
 
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(supported), ktls_supported_p,
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
                                 MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_probe, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_ulp, MRB_ARGS_REQ(1));
@@ -512,7 +512,7 @@ mrb_mruby_ktls_gem_final(mrb_state *mrb)
 #else /* !__linux__ */
 
 static mrb_value
-ktls_supported_p(mrb_state *mrb, mrb_value self)
+ktls_enabled_p(mrb_state *mrb, mrb_value self)
 {
   return mrb_false_value();
 }
@@ -528,7 +528,7 @@ void
 mrb_mruby_ktls_gem_init(mrb_state *mrb)
 {
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(supported), ktls_supported_p,
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
                                 MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_notimp, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_notimp, MRB_ARGS_REQ(1));

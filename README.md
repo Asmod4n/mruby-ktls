@@ -24,16 +24,20 @@ three caveats from the table below dissolve here by construction.
 
 ```ruby
 tls = KTLS::Socket.attach(sock, config, :server)  # adopts a dup of the fd
-tls.handshake                  # blocking convenience; steps, then offload
-tls.write("hello")             # kernel-encrypted when ktls_available?
+tls.handshake                  # blocking convenience; steps, then
+                               # try_enable if available?
+tls.write("hello")             # kernel-encrypted when available?
 line = tls.recv(4096)
 tls.close                      # close_notify, then the fd
 ```
 
-The handover comes in two moods: `#offload` shrugs (false, s2n keeps
-doing the crypto itself, the API stays identical), `#try_enable`
-raises - for deployments that PROMISE kTLS and want the broken
-promise loud, not a false.
+The kTLS surface is THREE methods, whole: `KTLS.enabled?` (is the
+tls subsystem initialized on this host? passive, loads nothing),
+`Socket#available?` (the same question, asked at the socket), and
+`Socket#try_enable` (the handover; raises when it cannot). No state
+mirror: s2n itself knows whether it is offloaded and routes
+accordingly - the API stays identical either way. A caller who wants
+the shrug writes `tls.try_enable if tls.available?`.
 
 Reactors use `#handshake_step` (or `KTLS::Connection` directly) and
 keep the raw-fd escape - with its duties.
@@ -66,7 +70,7 @@ sock.write(bytes)  # a plain write IS a TLS record from here on
 `KTLS::Connection#send/#recv` speak through s2n for whatever runs
 before - or without - the handover.
 
-Needing no keys and no s2n: `KTLS.supported?` (passive - see below)
+Needing no keys and no s2n: `KTLS.enabled?` (passive - see below)
 and `KTLS.ulp(io)` attaching the ULP raw.
 
 ## Nothing loads automatically
@@ -76,11 +80,10 @@ module on hosts that ship it as one. A library must never change
 kernel state because someone asked a question - so this gem splits
 asking from loading:
 
-- `KTLS.supported?` / `Socket#ktls_available?` are **passive**: they
-  read the `/proc/net/tls_stat` marker, which exists exactly when the
-  tls subsystem is initialized (module loaded, or built in). No
-  socket, no setsockopt, no module load - asking never changes the
-  answer.
+- `KTLS.enabled?` / `Socket#available?` are **passive**: they read
+  the `/proc/net/tls_stat` marker, which exists exactly when the tls
+  subsystem is initialized (module loaded, or built in). No socket,
+  no setsockopt, no module load - asking never changes the answer.
 - `KTLS.probe` is the ONE deliberate loader: it does the thing (a
   loopback TCP pair, `TCP_ULP` set to `"tls"`) and MAY autoload the
   module. Call it - or `modprobe tls` - on purpose, once, at a place
@@ -135,13 +138,13 @@ intended pairing: their door closed, this one open.
 
 Linux with `CONFIG_TLS` for the handover (asked passively at runtime,
 never assumed - and never autoloaded, see above); the s2n handshake
-itself runs anywhere Linux. Non-Linux compiles: `supported?` answers
+itself runs anywhere Linux. Non-Linux compiles: `enabled?` answers
 `false`, operations raise `NotImplementedError`. Build needs cmake
 (AWS-LC ships pregenerated sources; no Go, no Perl).
 
 ## Tests
 
-`rake test` clones mruby master and proves: `supported?` answers
+`rake test` clones mruby master and proves: `enabled?` answers
 without loading anything, a loopback handshake completes
 single-threaded and stepped, application data round-trips through
 s2n, the handover paths refuse by name where the tls subsystem is

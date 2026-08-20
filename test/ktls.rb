@@ -23,16 +23,16 @@ TEST_KEY = "-----BEGIN PRIVATE KEY-----\n" \
   "efz3WSg779yfYlrzls9aKHinva0Rk8na7yETBqzSRK/FOE+NVEZ8bD7e\n" \
   "-----END PRIVATE KEY-----\n"
 
-assert('KTLS.supported? answers a boolean, passively - asking loads nothing') do
-  v = KTLS.supported?
+assert('KTLS.enabled? answers a boolean, passively - asking loads nothing') do
+  v = KTLS.enabled?
   assert_true v == true || v == false
   # Passive: asking twice cannot change the answer (a probe that
   # autoloaded the module would flip false -> true here).
-  assert_equal v, KTLS.supported?
+  assert_equal v, KTLS.enabled?
 end
 
 assert('KTLS.ulp refuses a socket that is not ESTABLISHED, with errno') do
-  skip 'kTLS not available on this host' unless KTLS.supported?
+  skip 'kTLS not available on this host' unless KTLS.enabled?
   sock = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM)
   begin
     assert_raise(SystemCallError) { KTLS.ulp(sock) }
@@ -107,11 +107,13 @@ assert('KTLS::Socket: the inherited socket API, TLS underneath') do
   end
   assert_equal :done, st
   assert_equal :done, ct
-  # Offload where the host allows it; the API is identical either way
-  # (s2n routes through the offloaded socket when it is offloaded).
-  s.offload
-  c.offload
-  assert_true [true, false].include?(s.offloaded?)
+  # Hand over where the host allows it - the guarded spelling of the
+  # shrug; the API is identical either way (s2n routes through the
+  # offloaded socket when it is offloaded).
+  if s.available?
+    s.try_enable
+    c.try_enable
+  end
   assert_equal :tls13, s.version
   assert_equal 14, c.write('hello over tls')
   got = ''
@@ -129,7 +131,7 @@ assert('handover paths refuse by name instead of autoloading the module') do
   # Provable exactly where the tls subsystem is NOT initialized: the
   # gate must refuse - loudly, by name - rather than let setsockopt
   # autoload the module as a side effect of using the API.
-  skip 'tls subsystem initialized on this host' if KTLS.supported?
+  skip 'tls subsystem initialized on this host' if KTLS.enabled?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
   ccfg = KTLS::Config.client
   speer, cpeer = ktls_loopback_pair
@@ -154,8 +156,8 @@ assert('handover paths refuse by name instead of autoloading the module') do
   end
 end
 
-assert('KTLS::Socket#try_enable raises where #offload shrugs') do
-  skip 'tls subsystem initialized on this host' if KTLS.supported?
+assert('KTLS::Socket#try_enable raises; #available? saw it coming') do
+  skip 'tls subsystem initialized on this host' if KTLS.enabled?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
   ccfg = KTLS::Config.client
   speer, cpeer = ktls_loopback_pair
@@ -170,10 +172,9 @@ assert('KTLS::Socket#try_enable raises where #offload shrugs') do
     break if st == :done && ct == :done
   end
   assert_equal :done, st
-  # The shrug: false, and the connection keeps working through s2n.
-  assert_false s.offload
-  assert_false s.offloaded?
-  # The promise: same handover, loud - and it names the way out.
+  # The question agrees with what the attempt is about to say.
+  assert_false s.available?
+  # The attempt: loud, and it names the way out.
   err = nil
   begin
     s.try_enable
@@ -183,7 +184,6 @@ assert('KTLS::Socket#try_enable raises where #offload shrugs') do
   assert_true err != nil, 'try_enable did not raise'
   assert_true err.message.include?('not initialized'),
               "unexpected error: #{err.message.inspect}"
-  assert_false s.offloaded?
   # Refusing did not poison the connection: data still flows via s2n.
   assert_equal 5, c.write('still')
   got = ''
@@ -194,7 +194,7 @@ assert('KTLS::Socket#try_enable raises where #offload shrugs') do
 end
 
 assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
-  skip 'kTLS not available on this host' unless KTLS.supported?
+  skip 'kTLS not available on this host' unless KTLS.enabled?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
   ccfg = KTLS::Config.client
   speer, cpeer = ktls_loopback_pair
