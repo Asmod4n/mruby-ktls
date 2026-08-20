@@ -324,6 +324,35 @@ ktls_conn_version(mrb_state *mrb, mrb_value self)
   }
 }
 
+/* conn.shutdown -> :done | :reading | :writing. Steps a clean TLS
+ * shutdown (close_notify both ways, RFC 8446 6.1); call again when
+ * the fd is ready. KTLS::Socket#close drives it best-effort. */
+static mrb_value
+ktls_conn_shutdown(mrb_state *mrb, mrb_value self)
+{
+  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
+  s2n_blocked_status blocked = S2N_NOT_BLOCKED;
+  if (s2n_shutdown(c->conn, &blocked) != S2N_SUCCESS) {
+    if (s2n_error_get_type(s2n_errno) != S2N_ERR_T_BLOCKED) {
+      ktls_s2n_raise(mrb, "s2n_shutdown");
+    }
+  }
+  return ktls_blocked_sym(mrb, blocked);
+}
+
+/* KTLS.dup_fd(fd) -> Integer. KTLS::Socket.attach adopts a COPY of
+ * the caller's fd (dup), so both objects own their descriptor and
+ * either may close without killing the other. */
+static mrb_value
+ktls_dup_fd(mrb_state *mrb, mrb_value self)
+{
+  mrb_int fd;
+  mrb_get_args(mrb, "i", &fd);
+  const int nfd = dup((int)fd);
+  if (nfd < 0) mrb_sys_fail(mrb, "dup");
+  return mrb_fixnum_value(nfd);
+}
+
 /* conn.cipher -> the negotiated cipher's IANA name. The caller needs
  * it to know which encryption limit applies to raw-fd sends after the
  * handover: AES-GCM ~388GB per direction per key, CHACHA20-POLY1305
@@ -416,6 +445,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   mrb_define_module_function_id(mrb, m, MRB_SYM_Q(supported), ktls_supported_p,
                                 MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_ulp, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, m, MRB_SYM(dup_fd), ktls_dup_fd, MRB_ARGS_REQ(1));
 
   struct RClass *cfg = mrb_define_class_under_id(mrb, m, MRB_SYM(Config), mrb->object_class);
   MRB_SET_INSTANCE_TT(cfg, MRB_TT_DATA);
@@ -431,6 +461,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   mrb_define_method_id(mrb, cn, MRB_SYM(negotiate), ktls_conn_negotiate, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(version), ktls_conn_version, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(cipher), ktls_conn_cipher, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, cn, MRB_SYM(shutdown), ktls_conn_shutdown, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(send), ktls_conn_send, MRB_ARGS_REQ(1));

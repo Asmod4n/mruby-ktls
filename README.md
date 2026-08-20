@@ -11,6 +11,28 @@ submodules. After `negotiate` the kernel takes the record layer
 `send`/`recv` - or io_uring submissions - while s2n leaves the data
 path.
 
+## KTLS::Socket - the socket API, subclassed
+
+For everyone who just wants a socket: `KTLS::Socket < TCPSocket`
+adopts an existing connection and replaces ONLY what must stay under
+s2n's eyes - `#write` routes through `s2n_send` (after the handover
+that submits through the OFFLOADED socket: kernel crypto, record
+accounting, KeyUpdates when due), `#recv` through `s2n_recv` (an
+incoming KeyUpdate is processed, not EIO). Everything else is
+inherited untouched; `IO.select` works because the fd is real. The
+three caveats from the table below dissolve here by construction.
+
+```ruby
+tls = KTLS::Socket.attach(sock, config, :server)  # adopts a dup of the fd
+tls.handshake!                 # blocking convenience; steps + offload!
+tls.write("hello")             # kernel-encrypted when offloaded?
+line = tls.recv(4096)
+tls.close                      # close_notify, then the fd
+```
+
+Reactors use `#handshake_step` (or `KTLS::Connection` directly) and
+keep the raw-fd escape - with its duties.
+
 ## Shape
 
 Made for a one-thread nonblocking reactor: the fd goes `O_NONBLOCK`

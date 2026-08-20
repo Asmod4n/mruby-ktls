@@ -88,6 +88,40 @@ assert('s2n: a loopback handshake completes, single-threaded, stepped') do
   end
 end
 
+assert('KTLS::Socket: the inherited socket API, TLS underneath') do
+  scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
+  ccfg = KTLS::Config.client
+  speer, cpeer = ktls_loopback_pair
+  s = KTLS::Socket.attach(speer, scfg, :server)
+  c = KTLS::Socket.attach(cpeer, ccfg, :client)
+  speer.close  # attach adopted a dup: the originals may go
+  cpeer.close
+  st = ct = :reading
+  200.times do
+    st = s.handshake_step unless st == :done
+    ct = c.handshake_step unless ct == :done
+    break if st == :done && ct == :done
+  end
+  assert_equal :done, st
+  assert_equal :done, ct
+  # Offload where the host allows it; the API is identical either way
+  # (s2n routes through the offloaded socket when it is offloaded).
+  s.offload!
+  c.offload!
+  assert_true [true, false].include?(s.offloaded?)
+  assert_equal :tls13, s.version
+  assert_equal 14, c.write('hello over tls')
+  got = ''
+  got << s.recv(64) while got.bytesize < 14
+  assert_equal 'hello over tls', got
+  # The inherited surface is intact underneath.
+  assert_true c.fileno.is_a?(Integer)
+  c.close
+  # The close_notify arrives as end of stream, like TCPSocket's ''.
+  assert_equal '', s.recv(16)
+  s.close
+end
+
 assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
   skip 'kTLS not available on this host' unless KTLS.supported?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)

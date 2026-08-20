@@ -39,8 +39,10 @@ MRuby::Gem::Specification.new('mruby-ktls') do |spec|
     spec.linker.flags_after_libraries += [libs2n, libcrypto]
   end
 
-  spec.add_test_dependency 'mruby-io'
-  spec.add_test_dependency 'mruby-socket'
-  spec.add_test_dependency 'mruby-errno'
+  # KTLS::Socket subclasses TCPSocket (mrblib/ktls_socket.rb): the
+  # socket API is the product surface, not just a test convenience.
+  spec.add_dependency 'mruby-io'
+  spec.add_dependency 'mruby-socket'
+  spec.add_dependency 'mruby-errno'
   spec.add_test_dependency 'mruby-string-ext'
 end
