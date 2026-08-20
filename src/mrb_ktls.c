@@ -60,12 +60,30 @@ ktls_set_ulp(int fd)
   return setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls"));
 }
 
-/* The probe DOES the thing: a loopback pair, ULP on the connected end.
- * TCP_ULP demands an ESTABLISHED socket, so nothing cheaper answers
- * honestly. Any failure - no CONFIG_TLS, module loading denied, no
- * loopback - reads as "not supported here", which is the question. */
+/* Asking must never LOAD: setsockopt(TCP_ULP, "tls") autoloads the
+ * tls module, and a capability question has no business changing
+ * kernel state. /proc/net/tls_stat exists exactly when tls is
+ * initialized - as a module already loaded, or built in - so the
+ * passive answer is "usable right now, nothing touched". */
+static int
+ktls_initialized(void)
+{
+  return access("/proc/net/tls_stat", F_OK) == 0;
+}
+
 static mrb_value
 ktls_supported_p(mrb_state *mrb, mrb_value self)
+{
+  return mrb_bool_value(ktls_initialized());
+}
+
+/* KTLS.probe - the ONE deliberate loader: does the thing (a loopback
+ * pair, ULP on the connected end - TCP_ULP demands an ESTABLISHED
+ * socket, nothing cheaper answers honestly) and MAY autoload the tls
+ * module doing so. Operators who forbid module loading simply never
+ * call it; everything else in this gem stays passive. */
+static mrb_value
+ktls_probe(mrb_state *mrb, mrb_value self)
 {
   mrb_bool ok = FALSE;
   int ls = -1, a = -1, c = -1;
@@ -100,6 +118,11 @@ ktls_ulp(mrb_state *mrb, mrb_value self)
 {
   mrb_value io;
   mrb_get_args(mrb, "o", &io);
+  if (!ktls_initialized()) {
+    mrb_raise(mrb, E_RUNTIME_ERROR,
+              "kTLS is not initialized (tls module not loaded) - load it "
+              "deliberately: modprobe tls, or KTLS.probe");
+  }
   if (ktls_set_ulp(ktls_fileno(mrb, io)) != 0) {
     mrb_sys_fail(mrb, "setsockopt(TCP_ULP, \"tls\")");
   }
@@ -368,10 +391,21 @@ ktls_conn_cipher(mrb_state *mrb, mrb_value self)
 
 /* conn.enable_ktls_send / conn.enable_ktls_recv - the handover. After both, the
  * fd's plain send/recv are TLS and s2n is out of the data path. */
+static void
+ktls_require_initialized(mrb_state *mrb)
+{
+  if (!ktls_initialized()) {
+    mrb_raise(mrb, E_RUNTIME_ERROR,
+              "kTLS is not initialized (tls module not loaded) - load it "
+              "deliberately: modprobe tls, or KTLS.probe");
+  }
+}
+
 static mrb_value
 ktls_conn_ktls_send(mrb_state *mrb, mrb_value self)
 {
   struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
+  ktls_require_initialized(mrb);
   if (s2n_connection_ktls_enable_send(c->conn) != S2N_SUCCESS) {
     ktls_s2n_raise(mrb, "ktls_enable_send");
   }
@@ -382,6 +416,7 @@ static mrb_value
 ktls_conn_ktls_recv(mrb_state *mrb, mrb_value self)
 {
   struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
+  ktls_require_initialized(mrb);
   if (s2n_connection_ktls_enable_recv(c->conn) != S2N_SUCCESS) {
     ktls_s2n_raise(mrb, "ktls_enable_recv");
   }
@@ -444,6 +479,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
   mrb_define_module_function_id(mrb, m, MRB_SYM_Q(supported), ktls_supported_p,
                                 MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_probe, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_ulp, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, m, MRB_SYM(dup_fd), ktls_dup_fd, MRB_ARGS_REQ(1));
 
@@ -494,6 +530,7 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
   mrb_define_module_function_id(mrb, m, MRB_SYM_Q(supported), ktls_supported_p,
                                 MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(probe), ktls_notimp, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_notimp, MRB_ARGS_REQ(1));
 }
 

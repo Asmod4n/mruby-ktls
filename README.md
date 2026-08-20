@@ -61,9 +61,30 @@ sock.write(bytes)  # a plain write IS a TLS record from here on
 `KTLS::Connection#send/#recv` speak through s2n for whatever runs
 before - or without - the handover.
 
-Needing no keys and no s2n: `KTLS.supported?` (a probe that DOES the
-thing - a loopback TCP pair, `TCP_ULP` set to `"tls"` - instead of
-guessing from versions) and `KTLS.ulp(io)` attaching the ULP raw.
+Needing no keys and no s2n: `KTLS.supported?` (passive - see below)
+and `KTLS.ulp(io)` attaching the ULP raw.
+
+## Nothing loads automatically
+
+Setting `TCP_ULP` to `"tls"` makes the kernel **autoload** the `tls`
+module on hosts that ship it as one. A library must never change
+kernel state because someone asked a question - so this gem splits
+asking from loading:
+
+- `KTLS.supported?` / `Socket#ktls_available?` are **passive**: they
+  read the `/proc/net/tls_stat` marker, which exists exactly when the
+  tls subsystem is initialized (module loaded, or built in). No
+  socket, no setsockopt, no module load - asking never changes the
+  answer.
+- `KTLS.probe` is the ONE deliberate loader: it does the thing (a
+  loopback TCP pair, `TCP_ULP` set to `"tls"`) and MAY autoload the
+  module. Call it - or `modprobe tls` - on purpose, once, at a place
+  you chose.
+- Every path that would trigger the autoload as a side effect -
+  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv` - refuses by
+  name when the subsystem is not initialized ("kTLS is not
+  initialized (tls module not loaded) - load it deliberately:
+  modprobe tls, or KTLS.probe") instead of loading it for you.
 
 ## Scope lines
 
@@ -106,19 +127,20 @@ intended pairing: their door closed, this one open.
 
 ## Requirements
 
-Linux with `CONFIG_TLS` for the handover (probed at runtime, never
-assumed); the s2n handshake itself runs anywhere Linux. Non-Linux
-compiles: `supported?` answers `false`, operations raise
-`NotImplementedError`. Build needs cmake (AWS-LC ships pregenerated
-sources; no Go, no Perl).
+Linux with `CONFIG_TLS` for the handover (asked passively at runtime,
+never assumed - and never autoloaded, see above); the s2n handshake
+itself runs anywhere Linux. Non-Linux compiles: `supported?` answers
+`false`, operations raise `NotImplementedError`. Build needs cmake
+(AWS-LC ships pregenerated sources; no Go, no Perl).
 
 ## Tests
 
-`rake test` clones mruby master and proves: the probe answers, a
-loopback handshake completes single-threaded and stepped, application
-data round-trips through s2n, and - where `CONFIG_TLS` exists - a
-plain socket write after `enable_ktls_send` arrives as a valid TLS
-record.
+`rake test` clones mruby master and proves: `supported?` answers
+without loading anything, a loopback handshake completes
+single-threaded and stepped, application data round-trips through
+s2n, the handover paths refuse by name where the tls subsystem is
+not initialized, and - where it is - a plain socket write after
+`enable_ktls_send` arrives as a valid TLS record.
 
 ## License
 

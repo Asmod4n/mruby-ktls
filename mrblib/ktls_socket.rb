@@ -62,7 +62,8 @@ module KTLS
     end
 
     # The public question: can THIS host hand the record layer to the
-    # kernel? Probed by doing (see KTLS.supported?), not guessed.
+    # kernel? PASSIVE (see KTLS.supported?): reads a /proc marker and
+    # never loads the tls module. KTLS.probe is the deliberate loader.
     def ktls_available?
       KTLS.supported?
     end
