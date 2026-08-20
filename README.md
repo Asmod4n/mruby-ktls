@@ -1,43 +1,74 @@
 # mruby-ktls
 
-Kernel TLS for mruby sockets: after a TLS handshake has produced key
-material, the kernel takes over the record layer (`TLS_TX`/`TLS_RX`),
-and the socket speaks plain `send`/`recv` - or io_uring sends - while
-the kernel encrypts. No userspace TLS stack touches the data path.
+A TLS handshake that exists only to hand the wire to the kernel.
 
-## Scope
+The stack is Amazon's, built to the **minimum that carries kTLS**:
+[AWS-LC](https://github.com/aws/aws-lc)'s libcrypto (its libssl is
+never built - s2n is the TLS layer) under
+[s2n-tls](https://github.com/aws/s2n-tls), both static, both pinned as
+submodules. After `negotiate` the kernel takes the record layer
+(`s2n_connection_ktls_enable_send/recv`) and the socket speaks plain
+`send`/`recv` - or io_uring submissions - while s2n leaves the data
+path.
 
-**In scope**: everything after the keys exist.
+## Shape
 
-- `KTLS.supported?` - a real probe (a loopback TCP pair, `TCP_ULP`
-  set to `"tls"`), not a version guess. Autoloads the `tls` module
-  where module loading is permitted.
-- `KTLS.ulp(io)` - attach the TLS upper-layer protocol to an
-  ESTABLISHED TCP socket. First step of every kTLS setup; raises
-  `SystemCallError` with the kernel's reason when refused.
-- Planned, in order: `KTLS.tx(io, cipher, key, iv, salt, seq)` /
-  `KTLS.rx(...)` installing `tls12_crypto_info_*` for AES-128-GCM,
-  AES-256-GCM and CHACHA20-POLY1305 (TLS 1.2 and 1.3 layouts), and
-  `KTLS.info(io)` for what is installed.
+Made for a one-thread nonblocking reactor: the fd goes `O_NONBLOCK`
+at attach, `negotiate` steps and never sleeps (self-service blinding),
+and both ends of a handshake can be driven from a single thread.
 
-**Out of scope, permanently**: the handshake. kTLS does not do
-handshakes and neither does this gem - bring keys from whatever
-negotiated them (OpenSSL, mbedTLS, a session-ticket store). This gem
-is the boundary between "keys exist" and "the kernel owns the wire".
+```ruby
+scfg = KTLS::Config.server(cert_pem, key_pem)
+scfg.policy = '20190214'          # a TLS 1.2 lane; kTLS-ready
 
-## Why
+conn = KTLS::Connection.new(scfg, sock, :server)
+loop do
+  case conn.negotiate
+  when :done    then break
+  when :reading then wait_readable(sock)   # your reactor's wait
+  when :writing then wait_writable(sock)
+  end
+end
 
-An io_uring reactor wants one send per response and zero userspace
-copies. A userspace TLS record layer breaks both. With kTLS the
-reactor's data path stays byte-identical to its cleartext path - the
-send is the same send.
+conn.ktls_send!    # the kernel owns the send path now
+conn.ktls_recv!    # ... and the receive path
+sock.write(bytes)  # a plain write IS a TLS record from here on
+```
+
+`KTLS::Connection#send/#recv` speak through s2n for whatever runs
+before - or without - the handover.
+
+Needing no keys and no s2n: `KTLS.supported?` (a probe that DOES the
+thing - a loopback TCP pair, `TCP_ULP` set to `"tls"` - instead of
+guessing from versions) and `KTLS.ulp(io)` attaching the ULP raw.
+
+## Scope lines
+
+- **Client verification is currently DISABLED** (`KTLS::Config.client`
+  is for loopback tests and pinned deployments that verify
+  themselves). A trust-store API is the next slab; nothing here
+  pretends to be one.
+- TLS 1.3 kTLS is not wired: s2n calls its own flag
+  `ktls_enable_unsafe_tls13` for a reason (key updates). The 1.2
+  AES-GCM lane is the kTLS lane until that story settles.
+- Why kTLS at all, measured on the old tree: throughput parity with
+  userspace TLS, RSS is the win, and splice into a kTLS socket works -
+  file bodies never touch userspace.
 
 ## Requirements
 
-Linux with `CONFIG_TLS` (module or built-in), kernel >= 4.13 for
-TLS_TX, >= 4.17 for TLS_RX; TLS 1.3 crypto-info layouts need >= 5.10.
-On non-Linux the gem compiles, `KTLS.supported?` answers `false`, and
-every operation raises `NotImplementedError`.
+Linux with `CONFIG_TLS` for the handover (probed at runtime, never
+assumed); the s2n handshake itself runs anywhere Linux. Non-Linux
+compiles: `supported?` answers `false`, operations raise
+`NotImplementedError`. Build needs cmake (AWS-LC ships pregenerated
+sources; no Go, no Perl).
+
+## Tests
+
+`rake test` clones mruby master and proves: the probe answers, a
+loopback handshake completes single-threaded and stepped, application
+data round-trips through s2n, and - where `CONFIG_TLS` exists - a
+plain socket write after `ktls_send!` arrives as a valid TLS record.
 
 ## License
 
