@@ -27,12 +27,12 @@ module KTLS
     end
 
     # One nonblocking handshake step: :done | :reading | :writing.
-    # Reactors drive this; #handshake! is the blocking convenience.
+    # Reactors drive this; #handshake is the blocking convenience.
     def handshake_step
       @ktls.negotiate
     end
 
-    def handshake!
+    def handshake
       loop do
         case handshake_step
         when :done then break
@@ -40,7 +40,7 @@ module KTLS
         else IO.select([self])
         end
       end
-      offload!
+      offload
       self
     end
 
@@ -49,9 +49,9 @@ module KTLS
     # API above stays identical - s2n routes sends through the
     # offloaded socket when it is offloaded, and does the crypto
     # itself when it is not. True = the kernel owns the wire.
-    def offload!
-      @ktls.ktls_send!
-      @ktls.ktls_recv!
+    def offload
+      @ktls.enable_ktls_send
+      @ktls.enable_ktls_recv
       @offloaded = true
     rescue RuntimeError
       @offloaded = false
@@ -59,6 +59,12 @@ module KTLS
 
     def offloaded?
       @offloaded
+    end
+
+    # The public question: can THIS host hand the record layer to the
+    # kernel? Probed by doing (see KTLS.supported?), not guessed.
+    def ktls_available?
+      KTLS.supported?
     end
 
     def version = @ktls.version

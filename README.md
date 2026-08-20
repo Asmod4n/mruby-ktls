@@ -24,8 +24,8 @@ three caveats from the table below dissolve here by construction.
 
 ```ruby
 tls = KTLS::Socket.attach(sock, config, :server)  # adopts a dup of the fd
-tls.handshake!                 # blocking convenience; steps + offload!
-tls.write("hello")             # kernel-encrypted when offloaded?
+tls.handshake                  # blocking convenience; steps, then offload
+tls.write("hello")             # kernel-encrypted when ktls_available?
 line = tls.recv(4096)
 tls.close                      # close_notify, then the fd
 ```
@@ -53,8 +53,8 @@ loop do
   end
 end
 
-conn.ktls_send!    # the kernel owns the send path now
-conn.ktls_recv!    # ... and the receive path
+conn.enable_ktls_send   # the kernel owns the send path now
+conn.enable_ktls_recv   # ... and the receive path
 sock.write(bytes)  # a plain write IS a TLS record from here on
 ```
 
@@ -117,7 +117,8 @@ sources; no Go, no Perl).
 `rake test` clones mruby master and proves: the probe answers, a
 loopback handshake completes single-threaded and stepped, application
 data round-trips through s2n, and - where `CONFIG_TLS` exists - a
-plain socket write after `ktls_send!` arrives as a valid TLS record.
+plain socket write after `enable_ktls_send` arrives as a valid TLS
+record.
 
 ## License
 

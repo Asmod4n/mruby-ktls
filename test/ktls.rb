@@ -106,8 +106,8 @@ assert('KTLS::Socket: the inherited socket API, TLS underneath') do
   assert_equal :done, ct
   # Offload where the host allows it; the API is identical either way
   # (s2n routes through the offloaded socket when it is offloaded).
-  s.offload!
-  c.offload!
+  s.offload
+  c.offload
   assert_true [true, false].include?(s.offloaded?)
   assert_equal :tls13, s.version
   assert_equal 14, c.write('hello over tls')
@@ -131,7 +131,7 @@ assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
     sconn = KTLS::Connection.new(scfg, speer, :server)
     cconn = KTLS::Connection.new(ccfg, cpeer, :client)
     assert_true ktls_handshake(sconn, cconn)
-    sconn.ktls_send!  # the server's send path belongs to the kernel now
+    sconn.enable_ktls_send  # the server's send path belongs to the kernel now
     # A plain write on the server fd arrives decrypted through s2n on
     # the client: the kernel wrote the TLS record.
     speer.write('kernel wrote this')

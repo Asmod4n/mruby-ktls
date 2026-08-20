@@ -366,7 +366,7 @@ ktls_conn_cipher(mrb_state *mrb, mrb_value self)
   return mrb_str_new_cstr(mrb, name);
 }
 
-/* conn.ktls_send! / conn.ktls_recv! - the handover. After both, the
+/* conn.enable_ktls_send / conn.enable_ktls_recv - the handover. After both, the
  * fd's plain send/recv are TLS and s2n is out of the data path. */
 static mrb_value
 ktls_conn_ktls_send(mrb_state *mrb, mrb_value self)
@@ -462,8 +462,8 @@ mrb_mruby_ktls_gem_init(mrb_state *mrb)
   mrb_define_method_id(mrb, cn, MRB_SYM(version), ktls_conn_version, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(cipher), ktls_conn_cipher, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(shutdown), ktls_conn_shutdown, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM_B(ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, cn, MRB_SYM(enable_ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, cn, MRB_SYM(enable_ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, cn, MRB_SYM(send), ktls_conn_send, MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, cn, MRB_SYM(recv), ktls_conn_recv, MRB_ARGS_REQ(1));
 }
