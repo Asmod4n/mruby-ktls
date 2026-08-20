@@ -44,15 +44,26 @@ module KTLS
       self
     end
 
-    # Hands the record layer to the kernel where the host allows it
-    # (CONFIG_TLS, kernel >= 5.10 for 1.3 layouts). Either way the
-    # API above stays identical - s2n routes sends through the
-    # offloaded socket when it is offloaded, and does the crypto
-    # itself when it is not. True = the kernel owns the wire.
-    def offload
+    # Hands the record layer to the kernel and RAISES when it cannot:
+    # the "not initialized" refusal (load the tls module deliberately
+    # - modprobe tls, or KTLS.probe) and s2n's own errors pass
+    # through untouched. For callers whose deployment PROMISES kTLS
+    # and who want the broken promise loud, not a false.
+    def try_enable
       @ktls.enable_ktls_send
       @ktls.enable_ktls_recv
       @offloaded = true
+      self
+    end
+
+    # The shrugging sibling: same handover, but a host that cannot
+    # take it answers false and s2n keeps doing the crypto itself -
+    # the API above stays identical either way (s2n routes sends
+    # through the offloaded socket when it is offloaded). True = the
+    # kernel owns the wire.
+    def offload
+      try_enable
+      true
     rescue RuntimeError
       @offloaded = false
     end

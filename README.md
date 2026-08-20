@@ -30,6 +30,11 @@ line = tls.recv(4096)
 tls.close                      # close_notify, then the fd
 ```
 
+The handover comes in two moods: `#offload` shrugs (false, s2n keeps
+doing the crypto itself, the API stays identical), `#try_enable`
+raises - for deployments that PROMISE kTLS and want the broken
+promise loud, not a false.
+
 Reactors use `#handshake_step` (or `KTLS::Connection` directly) and
 keep the raw-fd escape - with its duties.
 
@@ -81,8 +86,9 @@ asking from loading:
   module. Call it - or `modprobe tls` - on purpose, once, at a place
   you chose.
 - Every path that would trigger the autoload as a side effect -
-  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv` - refuses by
-  name when the subsystem is not initialized ("kTLS is not
+  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv`,
+  `Socket#try_enable` - refuses by name when the subsystem is not
+  initialized ("kTLS is not
   initialized (tls module not loaded) - load it deliberately:
   modprobe tls, or KTLS.probe") instead of loading it for you.
 

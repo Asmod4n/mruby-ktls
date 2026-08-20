@@ -154,6 +154,45 @@ assert('handover paths refuse by name instead of autoloading the module') do
   end
 end
 
+assert('KTLS::Socket#try_enable raises where #offload shrugs') do
+  skip 'tls subsystem initialized on this host' if KTLS.supported?
+  scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
+  ccfg = KTLS::Config.client
+  speer, cpeer = ktls_loopback_pair
+  s = KTLS::Socket.attach(speer, scfg, :server)
+  c = KTLS::Socket.attach(cpeer, ccfg, :client)
+  speer.close
+  cpeer.close
+  st = ct = :reading
+  200.times do
+    st = s.handshake_step unless st == :done
+    ct = c.handshake_step unless ct == :done
+    break if st == :done && ct == :done
+  end
+  assert_equal :done, st
+  # The shrug: false, and the connection keeps working through s2n.
+  assert_false s.offload
+  assert_false s.offloaded?
+  # The promise: same handover, loud - and it names the way out.
+  err = nil
+  begin
+    s.try_enable
+  rescue RuntimeError => e
+    err = e
+  end
+  assert_true err != nil, 'try_enable did not raise'
+  assert_true err.message.include?('not initialized'),
+              "unexpected error: #{err.message.inspect}"
+  assert_false s.offloaded?
+  # Refusing did not poison the connection: data still flows via s2n.
+  assert_equal 5, c.write('still')
+  got = ''
+  got << s.recv(16) while got.bytesize < 5
+  assert_equal 'still', got
+  c.close
+  s.close
+end
+
 assert('kTLS handover: after enable, plain socket I/O IS the TLS channel') do
   skip 'kTLS not available on this host' unless KTLS.supported?
   scfg = KTLS::Config.server(TEST_CERT, TEST_KEY)
