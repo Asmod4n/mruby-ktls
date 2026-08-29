@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -75,15 +77,34 @@ static void collect(ktls_exchange *to, int fd_to)
   }
 }
 
+/* Whatever is still on the wire, with a moment's patience for bytes
+ * the peer sent as it finished. A server writes its NewSessionTickets
+ * exactly there - after the last handshake byte, under the
+ * application key - so they are in flight when both sides report
+ * done, and the peer has to CONSUME them or the two disagree about
+ * where the record sequence stands. */
+static void drain(ktls_exchange *to, int fd)
+{
+  const int fl = fcntl(fd, F_GETFL, 0);
+  fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+  unsigned char buf[16384];
+  for (int quiet = 0; quiet < 2;) {
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      ktls_exchange_feed(to, buf, (size_t) n);
+      quiet = 0;
+      continue;
+    }
+    struct pollfd pf = { .fd = fd, .events = POLLIN };
+    if (poll(&pf, 1, 50) <= 0) quiet++;
+  }
+  fcntl(fd, F_SETFL, fl);
+  unsigned char plain[16384];
+  while (ktls_exchange_backlog(to, plain, sizeof(plain)) != 0) { }
+}
+
 int main(int argc, char **argv)
 {
-  if (!ktls_initialized()) {
-    printf("this kernel has no tls ULP - %s\n",
-           ktls_available() ? "it ships one: modprobe tls, or run ktls_load_module()"
-                            : "and no module to load. Nothing to prove here.");
-    return 77;
-  }
-
   size_t clen = 0, klen = 0;
   char *cert = slurp("examples/cert.pem", &clen);
   char *key = slurp("examples/key.pem", &klen);
@@ -116,9 +137,30 @@ int main(int argc, char **argv)
   ok(ss == KTLS_DONE && cs == KTLS_DONE, "the exchange finishes over a real socket");
   printf("  (negotiated %s)\n", ktls_exchange_cipher(s));
 
-  unsigned char backlog[4096];
-  (void) ktls_exchange_backlog(s, backlog, sizeof(backlog));
-  (void) ktls_exchange_backlog(c, backlog, sizeof(backlog));
+  /* Both sides take what is still in flight. Without this the client
+   * never consumes the server's tickets, and the mismatch below is
+   * invisible until the first record the kernel cannot open. */
+  drain(c, cfd);
+  drain(s, sfd);
+
+  /* The check that names it. Two sides that disagree here would hand
+   * the kernel two different starting points and fail on the first
+   * record - as a decryption error, far from the cause. */
+  const uint64_t s_tx = ktls_record_sequence(s, KTLS_TX);
+  const uint64_t c_rx = ktls_record_sequence(c, KTLS_RX);
+  const uint64_t c_tx = ktls_record_sequence(c, KTLS_TX);
+  const uint64_t s_rx = ktls_record_sequence(s, KTLS_RX);
+  printf("  (sequences: server tx %llu / client rx %llu, client tx %llu / server rx %llu)\n",
+         (unsigned long long) s_tx, (unsigned long long) c_rx,
+         (unsigned long long) c_tx, (unsigned long long) s_rx);
+  ok(s_tx == c_rx && c_tx == s_rx, "both sides agree where the record sequence stands");
+
+  if (!ktls_initialized()) {
+    printf("\nthis kernel has no tls ULP - %s\n",
+           ktls_available() ? "it ships one: modprobe tls, or run ktls_load_module()"
+                            : "and no module to load. The handover itself is unproven here.");
+    return fails != 0 ? 1 : 77;
+  }
 
   /* THE handover. Both directions or neither. */
   ok(ktls_offload(s, sfd) == 0, "the server's socket takes both keys");
