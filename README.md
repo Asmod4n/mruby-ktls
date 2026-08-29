@@ -89,6 +89,28 @@ nothing else — `ktls_next_key` turns it one notch with RFC 8446 7.2's
 `"traffic upd"` label. That is what makes AES-GCM's limit answerable
 rather than fatal.
 
+## Linux and FreeBSD
+
+Two kernels carry TLS and they agree on nothing but the idea.
+
+| | Linux | FreeBSD |
+|---|---|---|
+| attach | `setsockopt(TCP_ULP, "tls")` | nothing - the keys go straight on |
+| is it there | `/proc/net/tls_stat` | `kern.ipc.tls.enable` |
+| turn it on | `modprobe tls` (or `ktls_load_module`) | the same sysctl, written |
+| the struct | `tls12_crypto_info_*`, one per cipher, material inside | one `struct tls_enable`, pointing at it |
+| the iv | split: AES-GCM 4 salt + 8 iv, ChaCha all 12 | never split - all 12, with `iv_len` |
+| receiving | always | only where `TCP_RXTLS_ENABLE` exists |
+
+`ktls_attach_ulp` is a no-op on FreeBSD so no caller needs an `#ifdef`,
+and `ktls_sol_tls` / `ktls_optname` answer that kernel's level and
+names. Where receiving cannot be offloaded, `ktls_offload` refuses by
+name rather than handing over half a socket.
+
+The FreeBSD half is written against `sys/sys/ktls.h` and OpenSSL's own
+FreeBSD path, and has not been compiled on FreeBSD. It is marked here
+so nobody mistakes it for tested.
+
 ## Reading a kernel-owned socket
 
 **Never a plain `recv`.** A record that is not application data — an

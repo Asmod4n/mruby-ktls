@@ -5,14 +5,20 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 
 #include <fcntl.h>
-#include <linux/tls.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#if defined(__linux__)
+#include <linux/tls.h>
 #include <sys/utsname.h>
+#else
+#include <sys/ktls.h>
+#include <sys/sysctl.h>
+#endif
 #if defined(__aarch64__)
 #include <sys/auxv.h>
 #endif
@@ -38,7 +44,7 @@
 #include <openssl/params.h>
 #include <openssl/ssl.h>
 
-#ifndef TCP_ULP
+#if defined(__linux__) && !defined(TCP_ULP)
 #define TCP_ULP 31
 #endif
 
@@ -46,6 +52,12 @@
  * a 32-byte key, a 12-byte iv with no salt beside it, and a record
  * sequence that starts at zero for the first application record. */
 #define KTLS_SECRET_MAX 64
+
+/* The two suites this library offers, named here and not by either
+ * kernel's constant: Linux spells them TLS_CIPHER_*, FreeBSD CRYPTO_*,
+ * and the exchange has no business knowing which it stands on. */
+#define KTLS_AES_GCM_128       1
+#define KTLS_CHACHA20_POLY1305 2
 
 /* Spelled per language rather than as C11's keyword: this file is
  * built by a C compiler in the gem and by a C++ one where an embedder
@@ -83,6 +95,57 @@ const char *ktls_last_error(void)
 }
 
 /* ---- what the kernel can do, asked without changing it ----------- */
+
+#if defined(__FreeBSD__)
+
+/* kern.ipc.tls.enable is both questions at once: the sysctl exists
+ * where the kernel has the code, and is non-zero where it is on. */
+static int ktls_sysctl_int(const char *name, int *out)
+{
+  size_t len = sizeof(*out);
+  return sysctlbyname(name, out, &len, NULL, 0);
+}
+
+bool ktls_initialized(void)
+{
+  int on = 0;
+  return ktls_sysctl_int("kern.ipc.tls.enable", &on) == 0 && on != 0;
+}
+
+bool ktls_available(void)
+{
+  int on = 0;
+  return ktls_sysctl_int("kern.ipc.tls.enable", &on) == 0;
+}
+
+int ktls_load_module(void)
+{
+  const int on = 1;
+  if (sysctlbyname("kern.ipc.tls.enable", NULL, NULL, &on, sizeof(on)) != 0) {
+    ktls_fail("sysctl kern.ipc.tls.enable=1");
+    return -1;
+  }
+  return 0;
+}
+
+/* Nothing to attach: the keys go straight on. A no-op so the caller
+ * needs no #ifdef of its own. */
+int ktls_attach_ulp(int fd) { (void) fd; return 0; }
+
+int ktls_sol_tls(void) { return IPPROTO_TCP; }
+
+int ktls_optname(ktls_direction dir)
+{
+#ifdef TCP_RXTLS_ENABLE
+  return dir == KTLS_TX ? TCP_TXTLS_ENABLE : TCP_RXTLS_ENABLE;
+#else
+  /* Receiving arrived after sending; without it this library refuses,
+   * because half a socket is not an offer it makes. */
+  return dir == KTLS_TX ? TCP_TXTLS_ENABLE : -1;
+#endif
+}
+
+#else /* Linux */
 
 bool ktls_initialized(void)
 {
@@ -157,6 +220,8 @@ int ktls_attach_ulp(int fd)
 
 int ktls_sol_tls(void) { return SOL_TLS; }
 int ktls_optname(ktls_direction dir) { return dir == KTLS_TX ? TLS_TX : TLS_RX; }
+
+#endif
 
 /* ---- the keys this server answers with --------------------------- */
 
@@ -335,11 +400,17 @@ struct ktls_records {
 };
 
 /* The one blob setsockopt takes, in whichever shape the cipher has. */
+#if defined(__FreeBSD__)
+union ktls_info {
+  struct tls_enable en;
+};
+#else
 union ktls_info {
   struct tls_crypto_info head;
   struct tls12_crypto_info_aes_gcm_128 aes;
   struct tls12_crypto_info_chacha20_poly1305 chacha;
 };
+#endif
 
 struct ktls_exchange {
   SSL *ssl;
@@ -363,8 +434,12 @@ struct ktls_exchange {
    * the one public door onto the key schedule. */
   unsigned char secret[2][KTLS_SECRET_MAX];
   size_t secret_len[2];
-  int cipher;  /* TLS_CIPHER_AES_GCM_128 or TLS_CIPHER_CHACHA20_POLY1305 */
+  int cipher;  /* KTLS_AES_GCM_128 or KTLS_CHACHA20_POLY1305 */
   union ktls_info info[2];
+  /* RFC 8446 7.3 derives these once. FreeBSD's struct POINTS at them
+   * instead of embedding them, so they outlive the call either way. */
+  unsigned char key[2][32];
+  unsigned char iv[2][12];
 };
 
 static void ktls_scan(struct ktls_records *r, const unsigned char *p, size_t n)
@@ -541,42 +616,48 @@ static int ktls_expand(const unsigned char *secret, size_t slen, const char *lab
   return 0;
 }
 
-/* RFC 8446 7.3 derives ONE 12-byte implicit iv. The kernel splits it
- * differently per cipher: AES-GCM takes 4 bytes as salt and 8 as iv,
- * ChaCha has no salt at all and takes all 12. */
 static int ktls_fill(struct ktls_exchange *x, int which)
 {
-  union ktls_info *ci = &x->info[which];
-  unsigned char iv[12];
-
   if (x->secret_len[which] == 0) {
     ktls_say("the traffic secret never arrived - is this OpenSSL built with TLS 1.3?");
     return -1;
   }
-  memset(ci, 0, sizeof(*ci));
-  ci->head.version = TLS_1_3_VERSION;
-  ci->head.cipher_type = x->cipher;
-
-  unsigned char *key;
-  size_t keylen;
-  if (x->cipher == TLS_CIPHER_AES_GCM_128) {
-    key = ci->aes.key;
-    keylen = sizeof(ci->aes.key);
-  } else {
-    key = ci->chacha.key;
-    keylen = sizeof(ci->chacha.key);
-  }
-  if (ktls_expand(x->secret[which], x->secret_len[which], "key", key, keylen) != 0 ||
-      ktls_expand(x->secret[which], x->secret_len[which], "iv", iv, sizeof(iv)) != 0) {
+  const size_t keylen = (x->cipher == KTLS_AES_GCM_128) ? 16 : 32;
+  if (ktls_expand(x->secret[which], x->secret_len[which], "key", x->key[which], keylen) != 0 ||
+      ktls_expand(x->secret[which], x->secret_len[which], "iv", x->iv[which],
+                  sizeof(x->iv[which])) != 0) {
     return -1;
   }
-  if (x->cipher == TLS_CIPHER_AES_GCM_128) {
-    memcpy(ci->aes.salt, iv, sizeof(ci->aes.salt));
-    memcpy(ci->aes.iv, iv + sizeof(ci->aes.salt), sizeof(ci->aes.iv));
+
+  union ktls_info *ci = &x->info[which];
+  memset(ci, 0, sizeof(*ci));
+#if defined(__FreeBSD__)
+  /* FreeBSD splits nothing: the whole implicit iv goes in with its
+   * length, and the struct refers to the exchange's own storage. */
+  ci->en.cipher_algorithm =
+      (x->cipher == KTLS_AES_GCM_128) ? CRYPTO_AES_NIST_GCM_16 : CRYPTO_CHACHA20_POLY1305;
+  ci->en.cipher_key = x->key[which];
+  ci->en.cipher_key_len = (int) keylen;
+  ci->en.iv = x->iv[which];
+  ci->en.iv_len = (int) sizeof(x->iv[which]);
+  ci->en.tls_vmajor = TLS_MAJOR_VER_ONE;
+  ci->en.tls_vminor = TLS_MINOR_VER_THREE;
+#else
+  /* RFC 8446 7.3 derives ONE 12-byte implicit iv, and Linux splits it
+   * per cipher: AES-GCM takes 4 bytes as salt and 8 as iv, ChaCha has
+   * no salt at all and takes all 12. */
+  ci->head.version = TLS_1_3_VERSION;
+  if (x->cipher == KTLS_AES_GCM_128) {
+    ci->head.cipher_type = TLS_CIPHER_AES_GCM_128;
+    memcpy(ci->aes.key, x->key[which], sizeof(ci->aes.key));
+    memcpy(ci->aes.salt, x->iv[which], sizeof(ci->aes.salt));
+    memcpy(ci->aes.iv, x->iv[which] + sizeof(ci->aes.salt), sizeof(ci->aes.iv));
   } else {
-    memcpy(ci->chacha.iv, iv, sizeof(ci->chacha.iv));
+    ci->head.cipher_type = TLS_CIPHER_CHACHA20_POLY1305;
+    memcpy(ci->chacha.key, x->key[which], sizeof(ci->chacha.key));
+    memcpy(ci->chacha.iv, x->iv[which], sizeof(ci->chacha.iv));
   }
-  OPENSSL_cleanse(iv, sizeof(iv));
+#endif
   return 0;
 }
 
@@ -586,8 +667,8 @@ static int ktls_negotiated_cipher(SSL *ssl)
   const SSL_CIPHER *c = SSL_get_current_cipher(ssl);
   const char *name = c != NULL ? SSL_CIPHER_get_name(c) : NULL;
   if (name == NULL) return 0;
-  if (strcmp(name, "TLS_AES_128_GCM_SHA256") == 0) return TLS_CIPHER_AES_GCM_128;
-  if (strcmp(name, "TLS_CHACHA20_POLY1305_SHA256") == 0) return TLS_CIPHER_CHACHA20_POLY1305;
+  if (strcmp(name, "TLS_AES_128_GCM_SHA256") == 0) return KTLS_AES_GCM_128;
+  if (strcmp(name, "TLS_CHACHA20_POLY1305_SHA256") == 0) return KTLS_CHACHA20_POLY1305;
   return 0;
 }
 
@@ -686,10 +767,15 @@ const void *ktls_crypto_info(const ktls_exchange *cx, ktls_direction dir, size_t
                            : ktls_records_between(&x->rx, x->rx_at_done, consumed);
 
   union ktls_info *ci = &x->info[which];
-  unsigned char *rec_seq = (x->cipher == TLS_CIPHER_AES_GCM_128) ? ci->aes.rec_seq
-                                                                 : ci->chacha.rec_seq;
+#if defined(__FreeBSD__)
+  unsigned char *rec_seq = ci->en.rec_seq;
+  *len = sizeof(ci->en);
+#else
+  unsigned char *rec_seq =
+      (x->cipher == KTLS_AES_GCM_128) ? ci->aes.rec_seq : ci->chacha.rec_seq;
+  *len = (x->cipher == KTLS_AES_GCM_128) ? sizeof(ci->aes) : sizeof(ci->chacha);
+#endif
   for (unsigned i = 0; i < 8; i++) rec_seq[7 - i] = (unsigned char) (seq >> (8 * i));
-  *len = (x->cipher == TLS_CIPHER_AES_GCM_128) ? sizeof(ci->aes) : sizeof(ci->chacha);
   return ci;
 }
 
@@ -736,7 +822,7 @@ int ktls_next_key(ktls_exchange *x, ktls_direction dir)
  * every sendmsg is at least one record and at most ceil(len/16384). */
 uint64_t ktls_record_limit(const ktls_exchange *x)
 {
-  return x->cipher == TLS_CIPHER_AES_GCM_128 ? (1ULL << 23) : 0;
+  return x->cipher == KTLS_AES_GCM_128 ? (1ULL << 23) : 0;
 }
 
 const char *ktls_exchange_cipher(const ktls_exchange *x)
@@ -760,21 +846,28 @@ int ktls_offload(const ktls_exchange *x, int fd)
              "deliberately: modprobe tls, or ktls_load_module()");
     return -1;
   }
-  if (ktls_attach_ulp(fd) != 0) return -1;
-  if (setsockopt(fd, SOL_TLS, TLS_TX, tx, (socklen_t) tx_len) != 0) {
-    ktls_fail("setsockopt(SOL_TLS, TLS_TX)");
+  const int level = ktls_sol_tls();
+  const int rx_name = ktls_optname(KTLS_RX);
+  if (rx_name < 0) {
+    ktls_say("this kernel offloads sending but not receiving, and half a "
+             "socket is not an offer this library makes");
     return -1;
   }
-  if (setsockopt(fd, SOL_TLS, TLS_RX, rx, (socklen_t) rx_len) != 0) {
-    ktls_fail("setsockopt(SOL_TLS, TLS_RX)");
+  if (ktls_attach_ulp(fd) != 0) return -1;
+  if (setsockopt(fd, level, ktls_optname(KTLS_TX), tx, (socklen_t) tx_len) != 0) {
+    ktls_fail("setsockopt(TLS_TX)");
+    return -1;
+  }
+  if (setsockopt(fd, level, rx_name, rx, (socklen_t) rx_len) != 0) {
+    ktls_fail("setsockopt(TLS_RX)");
     return -1;
   }
   return 0;
 }
 
-#else /* !__linux__ */
+#else /* neither Linux nor FreeBSD */
 
-static const char kNotHere[] = "kTLS is a Linux socket ULP";
+static const char kNotHere[] = "kTLS exists on Linux and FreeBSD; this is neither";
 
 const char *ktls_last_error(void) { return kNotHere; }
 bool ktls_initialized(void) { return false; }
