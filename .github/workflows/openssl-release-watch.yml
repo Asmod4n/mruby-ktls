@@ -1,0 +1,200 @@
+name: openssl release watch
+
+# Once a week, keep exactly one open tracking issue for the newest patch
+# release on the LTS series this gem is pinned to - and only while our
+# deps/openssl submodule is actually behind it. The check compares the
+# commit the submodule is pinned to against the commit the newest tag in
+# SERIES resolves to; equal means there is nothing to track.
+#
+# It watches a SERIES rather than "the latest release" on purpose. OpenSSL
+# ships non-LTS lines beside the LTS one, and their support windows are
+# short: 3.6 ends 2026-11-01, 4.0 ends 2027-05-14, while 3.5 runs to
+# 2030-04-08. A watcher pointed at "latest" would spend its life arguing
+# for a jump off long term support. The second job below is what notices
+# that the series itself is running out.
+
+on:
+  schedule:
+    - cron: '41 6 * * 1'   # Mondays, 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  SERIES: '3.5'
+  SERIES_EOL: '2030-04-08'   # openssl-library.org/policies/releasestrat
+
+jobs:
+  patch:
+    if: github.repository == 'Asmod4n/mruby-ktls'
+    runs-on: ubuntu-latest
+    steps:
+      # The gitlink lives in this repository's own tree, so the submodule
+      # contents are not needed - only the sha it points at.
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const LABEL = 'openssl-update';
+            const series = process.env.SERIES;
+
+            // --- the newest patch release on our series ---
+            const refs = await github.paginate(github.rest.git.listMatchingRefs, {
+              owner: 'openssl', repo: 'openssl', ref: `tags/openssl-${series}.`, per_page: 100,
+            });
+            const rel = refs
+              .map(r => r.ref.replace('refs/tags/', ''))
+              .map(t => ({ tag: t, m: new RegExp(`^openssl-${series}\\.(\\d+)$`).exec(t) }))
+              .filter(x => x.m)
+              .sort((a, b) => Number(a.m[1]) - Number(b.m[1]))
+              .pop();
+            if (!rel) { core.setFailed(`No openssl-${series}.* tags found`); return; }
+            const version = rel.tag.replace('openssl-', '');
+            const marker  = `<!-- openssl-watch:${version} -->`;
+
+            // --- what commit does deps/openssl point at? the source of truth
+            // for what we ship, so the watcher cannot flag a release that is
+            // already vendored ---
+            const { execSync } = require('child_process');
+            let pinned = '';
+            try {
+              const line = execSync('git ls-tree HEAD deps/openssl', { encoding: 'utf8' }).trim();
+              pinned = (line.split(/\s+/)[2] || '').toLowerCase();
+            } catch (e) {
+              core.warning(`Could not read deps/openssl pin: ${e.message}`);
+            }
+
+            // --- and what commit does the tag resolve to? (peel, if annotated) ---
+            let released = '';
+            try {
+              const ref = await github.rest.git.getRef({
+                owner: 'openssl', repo: 'openssl', ref: `tags/${rel.tag}`,
+              });
+              if (ref.data.object.type === 'tag') {
+                const t = await github.rest.git.getTag({
+                  owner: 'openssl', repo: 'openssl', tag_sha: ref.data.object.sha,
+                });
+                released = t.data.object.sha.toLowerCase();
+              } else {
+                released = ref.data.object.sha.toLowerCase();
+              }
+            } catch (e) {
+              core.warning(`Could not resolve ${rel.tag}: ${e.message}`);
+            }
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: LABEL });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                owner, repo, name: LABEL, color: '721412',
+                description: 'Tracks new upstream OpenSSL releases',
+              });
+            }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: LABEL, state: 'all', per_page: 100,
+            });
+
+            // Already there? The bump may have landed by hand, so retire any
+            // tracking issue still open and stop. Where either sha could not be
+            // read we fall through rather than silently skip.
+            if (pinned && released && pinned === released) {
+              for (const i of issues.filter(i => i.state === 'open' && (i.body || '').includes('openssl-watch:'))) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: i.number,
+                  body: `\`deps/openssl\` is already pinned to \`${rel.tag}\` (${released}); closing as done.`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: i.number, state: 'closed', state_reason: 'completed',
+                });
+              }
+              core.info(`deps/openssl already tracks ${version}; nothing to do.`);
+              return;
+            }
+
+            // Filed before - even if closed by hand - is never filed again.
+            if (issues.some(i => (i.body || '').includes(marker))) {
+              core.info(`OpenSSL ${version} already has an issue; nothing to do.`);
+              return;
+            }
+
+            for (const i of issues.filter(i => i.state === 'open' && (i.body || '').includes('openssl-watch:'))) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: i.number,
+                body: `Superseded by OpenSSL ${version}; closing in favor of the newer release.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: i.number, state: 'closed', state_reason: 'not_planned',
+              });
+            }
+
+            const body = [
+              marker,
+              `OpenSSL **${version}** (\`${rel.tag}\`) is out on the ${series} LTS series.`,
+              ``,
+              `- Changelog: https://github.com/openssl/openssl/blob/${rel.tag}/CHANGES.md`,
+              `- Security advisories: https://openssl-library.org/news/vulnerabilities/`,
+              ``,
+              `This library is the record layer's key schedule and the only crypto in`,
+              `the ktls process, so a security fix here is a security fix for every`,
+              `connection the server terminates.`,
+              ``,
+              `### Steps`,
+              `- [ ] Read the changelog, and the advisories if any`,
+              `- [ ] \`git -C deps/openssl fetch --depth 1 origin tag ${rel.tag} && git -C deps/openssl checkout ${rel.tag}\``,
+              `- [ ] \`rake test\` - it rebuilds the vendored libssl/libcrypto from the new pin`,
+              `- [ ] Run \`examples/ktls_handover.c\` on a kernel with CONFIG_TLS`,
+              ``,
+              `_Left unaddressed, this issue is closed and replaced when the next ${series} release appears._`,
+            ].join('\n');
+
+            const created = await github.rest.issues.create({
+              owner, repo,
+              title: `OpenSSL ${version} released - review & bump deps/openssl`,
+              body, labels: [LABEL],
+            });
+            core.info(`Opened #${created.data.number} for OpenSSL ${version}.`);
+
+  # A patch watcher cannot see the cliff it is walking towards: when the
+  # series itself goes out of support, "up to date" and "unmaintained" look
+  # exactly the same. This says so half a year ahead, once.
+  series:
+    if: github.repository == 'Asmod4n/mruby-ktls'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const series = process.env.SERIES;
+            const eol = new Date(process.env.SERIES_EOL);
+            const months = (eol - Date.now()) / (1000 * 60 * 60 * 24 * 30.4);
+            if (months > 6) {
+              core.info(`OpenSSL ${series} is supported for ${months.toFixed(1)} more months.`);
+              return;
+            }
+            const marker = `<!-- openssl-series-eol:${series} -->`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100,
+            });
+            if (issues.some(i => (i.body || '').includes(marker))) return;
+            await github.rest.issues.create({
+              owner, repo,
+              title: `OpenSSL ${series} support ends ${process.env.SERIES_EOL} - pick the next LTS`,
+              body: [
+                marker,
+                `The series \`deps/openssl\` is pinned to stops getting security fixes on`,
+                `**${process.env.SERIES_EOL}**. After that a green release watch means nothing.`,
+                ``,
+                `Pick the next LTS from https://openssl-library.org/policies/releasestrat/,`,
+                `move the pin, and change \`SERIES\` and \`SERIES_EOL\` in`,
+                `\`.github/workflows/openssl-release-watch.yml\`.`,
+              ].join('\n'),
+            });

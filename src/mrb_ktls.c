@@ -1,20 +1,11 @@
 /*
- * mruby-ktls: a TLS handshake that exists only to hand the wire to the
- * kernel. The stack is Amazon's, built to the minimum that carries
- * kTLS: AWS-LC's libcrypto (never its libssl) under s2n-tls, static.
- * After s2n_negotiate the kernel takes the record layer
- * (s2n_connection_ktls_enable_send/recv) and the socket speaks plain
- * send/recv - or io_uring submissions - while s2n leaves the data
- * path.
- *
- * Shaped for a one-thread nonblocking reactor: Connection#negotiate
- * steps (:done / :reading / :writing, never sleeps - self-service
- * blinding), the fd is switched to O_NONBLOCK at attach.
- *
- * KTLS.enabled? / KTLS.available? / KTLS.try_enable / KTLS.ulp need
- * no keys and no s2n: two passive questions, one deliberate loader,
- * one raw ULP attach (see below).
+ * The Ruby surface, one call deep over include/ktls.h - the same
+ * functions C and C++ callers use. Nothing about the exchange lives
+ * here: no socket, no record layer, no key material that ktls.c does
+ * not already own.
  */
+#include "ktls.h"
+
 #include <mruby.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
@@ -24,585 +15,317 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 
-#ifdef __linux__
-
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/utsname.h>
-#include <unistd.h>
 
-#include <s2n.h>
-#include <unstable/ktls.h>
-
-#ifndef SOL_TCP
-#define SOL_TCP 6
-#endif
-#ifndef TCP_ULP
-#define TCP_ULP 31
-#endif
-
-/* ---- raw ULP layer (no keys, no s2n) ------------------------------ */
-
-static int
-ktls_fileno(mrb_state *mrb, mrb_value io)
+static struct RClass *ktls_error_class(mrb_state *mrb)
 {
-  if (mrb_integer_p(io)) return (int)mrb_integer(io);
-  return (int)mrb_integer(mrb_convert_type(mrb, mrb_funcall_id(mrb, io, MRB_SYM(fileno), 0),
-                                           MRB_TT_INTEGER, "Integer", "to_i"));
+  return mrb_class_get_under_id(mrb, mrb_module_get_id(mrb, MRB_SYM(KTLS)), MRB_SYM(Error));
 }
 
-static int
-ktls_set_ulp(int fd)
+static void ktls_raise(mrb_state *mrb)
 {
-  return setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls"));
+  mrb_raise(mrb, ktls_error_class(mrb), ktls_last_error());
 }
 
-/* The capability surface is THREE module questions/acts, and only
- * try_enable changes anything:
- *
- *   KTLS.enabled?    - loaded AND active right now?
- *   KTLS.available?  - does THIS kernel ship the functionality?
- *   KTLS.try_enable  - one setsockopt on a dummy socket: the ONE
- *                      deliberate loader; raises when it cannot.
- *
- * Asking must never LOAD: setsockopt(TCP_ULP, "tls") autoloads the
- * tls module, and a capability question has no business changing
- * kernel state - so both questions are filesystem reads. */
+/* ---- KTLS::Keys --------------------------------------------------- */
 
-/* /proc/net/tls_stat exists exactly when tls is initialized - as a
- * module already loaded, or built in: "usable right now". */
-static int
-ktls_initialized(void)
+static void keys_free(mrb_state *mrb, void *p)
 {
-  return access("/proc/net/tls_stat", F_OK) == 0;
+  (void) mrb;
+  ktls_keys_free((ktls_keys *) p);
 }
 
-static mrb_value
-ktls_enabled_p(mrb_state *mrb, mrb_value self)
+static const struct mrb_data_type keys_type = { "KTLS::Keys", keys_free };
+
+static ktls_keys *keys_of(mrb_state *mrb, mrb_value self)
 {
-  return mrb_bool_value(ktls_initialized());
+  return (ktls_keys *) mrb_data_get_ptr(mrb, self, &keys_type);
 }
 
-/* memmem is a GNU extension; this is its portable little sibling. */
-static int
-ktls_memfind(const char *hay, size_t hlen, const char *pat, size_t plen)
-{
-  if (hlen < plen) return 0;
-  for (size_t i = 0; i <= hlen - plen; i++) {
-    if (hay[i] == pat[0] && memcmp(hay + i, pat, plen) == 0) return 1;
-  }
-  return 0;
-}
-
-/* Rolling substring search over a file: the pattern may straddle a
- * read boundary, so each round keeps the last strlen(pat)-1 bytes. */
-static int
-ktls_file_contains(const char *path, const char *pat)
-{
-  const size_t plen = strlen(pat);
-  char buf[4096];
-  size_t held = 0;
-  int found = 0;
-
-  const int fd = open(path, O_RDONLY);
-  if (fd < 0) return 0;
-  for (;;) {
-    const ssize_t n = read(fd, buf + held, sizeof(buf) - held);
-    if (n <= 0) break;
-    const size_t have = held + (size_t)n;
-    if (ktls_memfind(buf, have, pat, plen)) {
-      found = 1;
-      break;
-    }
-    held = plen - 1 < have ? plen - 1 : have;
-    memmove(buf, buf + (have - held), held);
-  }
-  close(fd);
-  return found;
-}
-
-/* KTLS.available? - does this kernel SHIP kTLS, loaded or not?
- * Passive: already initialized counts, else the running kernel's
- * module index must list net/tls/tls.ko (modules.dep for loadable,
- * modules.builtin for compiled-in; the substring also matches
- * compressed spellings like tls.ko.xz). A modul-less kernel without
- * CONFIG_TLS has neither - false, and try_enable cannot help. */
-static int
-ktls_module_shipped(void)
-{
-  struct utsname u;
-  char path[sizeof(u.release) + 64];
-
-  if (uname(&u) != 0) return 0;
-  snprintf(path, sizeof(path), "/lib/modules/%s/modules.dep", u.release);
-  if (ktls_file_contains(path, "net/tls/tls.ko")) return 1;
-  snprintf(path, sizeof(path), "/lib/modules/%s/modules.builtin", u.release);
-  return ktls_file_contains(path, "net/tls/tls.ko");
-}
-
-static mrb_value
-ktls_available_p(mrb_state *mrb, mrb_value self)
-{
-  return mrb_bool_value(ktls_initialized() || ktls_module_shipped());
-}
-
-/* KTLS.try_enable - the ONE deliberate loader: one setsockopt on a
- * dummy socket. The ULP lookup autoloads the tls module BEFORE the
- * ULP's init runs, and that init refuses a socket that is not
- * ESTABLISHED - so on a dummy socket ENOTCONN is the success sound:
- * the ULP was found, the module is loaded, only the socket's state
- * was refused. Anything else (ENOENT: this kernel has no tls ULP and
- * autoload found no module) raises with errno. */
-static mrb_value
-ktls_try_enable(mrb_state *mrb, mrb_value self)
-{
-  const int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) mrb_sys_fail(mrb, "socket");
-  const int rc = ktls_set_ulp(fd);
-  const int e = errno;
-  close(fd);
-  if (rc != 0 && e != ENOTCONN) {
-    errno = e;
-    mrb_sys_fail(mrb, "setsockopt(TCP_ULP, \"tls\")");
-  }
-  return mrb_true_value();
-}
-
-static mrb_value
-ktls_ulp(mrb_state *mrb, mrb_value self)
-{
-  mrb_value io;
-  mrb_get_args(mrb, "o", &io);
-  if (!ktls_initialized()) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
-              "kTLS is not initialized (tls module not loaded) - load it "
-              "deliberately: modprobe tls, or KTLS.try_enable");
-  }
-  if (ktls_set_ulp(ktls_fileno(mrb, io)) != 0) {
-    mrb_sys_fail(mrb, "setsockopt(TCP_ULP, \"tls\")");
-  }
-  return io;
-}
-
-/* ---- s2n layer ---------------------------------------------------- */
-
-static void
-ktls_s2n_raise(mrb_state *mrb, const char *what)
-{
-  mrb_raisef(mrb, E_RUNTIME_ERROR, "%s: %s", what, s2n_strerror(s2n_errno, "EN"));
-}
-
-/* Config: an s2n_config plus the cert chain it holds (s2n stores a
- * reference, not a copy - the chain must outlive the config). */
-struct ktls_config {
-  struct s2n_config *cfg;
-  struct s2n_cert_chain_and_key *chain;
-};
-
-static void
-ktls_config_free(mrb_state *mrb, void *p)
-{
-  struct ktls_config *c = (struct ktls_config *)p;
-  if (c == NULL) return;
-  if (c->cfg != NULL) s2n_config_free(c->cfg);
-  if (c->chain != NULL) s2n_cert_chain_and_key_free(c->chain);
-  mrb_free(mrb, c);
-}
-
-static const struct mrb_data_type ktls_config_type = {"KTLS::Config", ktls_config_free};
-
-/* TLS 1.3 is MANDATORY here: the default policy's minimum is 1.3.
- *
- * The 1.3 kTLS handover exists in s2n only behind
- * s2n_config_ktls_enable_unsafe_tls13 - and that call is the whole
- * KeyUpdate machinery, not its absence: s2n CAN send a KeyUpdate
- * through the offloaded socket (TLS_HANDSHAKE cmsg, re-derive,
- * re-setsockopt TLS_TX) and process a received one (re-setsockopt
- * TLS_RX). "unsafe" labels three caveats, all about raw-fd use, and
- * THIS LAYER'S EMBEDDER OWNS THEM NOW - decided knowingly:
- *
- *   1. The AES-GCM encryption limit (2^24.5 full records ~ 388GB per
- *      direction per key) is only accounted for traffic through
- *      s2n_send. Raw fd writes escape the count: the embedder caps
- *      bytes per connection below the limit (or prefers
- *      CHACHA20-POLY1305, which has no practical one) - see
- *      Connection#cipher.
- *   2. An incoming KeyUpdate surfaces on a raw read() as EIO, not as
- *      data. The embedder treats that as the end of the connection
- *      (errors kill the connection, never the process).
- *   3. Re-keying via a second setsockopt needs kernel >= 6.14.
- */
-static void
-ktls_config_common(mrb_state *mrb, struct ktls_config *c)
-{
-  c->cfg = s2n_config_new_minimal();
-  if (c->cfg == NULL) ktls_s2n_raise(mrb, "s2n_config_new_minimal");
-  if (s2n_config_set_cipher_preferences(c->cfg, "AWS-CRT-SDK-TLSv1.3") != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "set_cipher_preferences");
-  }
-  if (s2n_config_ktls_enable_unsafe_tls13(c->cfg) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "ktls_enable_unsafe_tls13");
-  }
-}
-
-/* KTLS::Config.server(cert_pem, key_pem) */
-static mrb_value
-ktls_config_server(mrb_state *mrb, mrb_value klass)
+/* KTLS::Keys.server(cert_pem, key_pem) */
+static mrb_value keys_server(mrb_state *mrb, mrb_value klass)
 {
   char *cert, *key;
   mrb_int certlen, keylen;
   mrb_get_args(mrb, "ss", &cert, &certlen, &key, &keylen);
 
-  struct ktls_config *c = (struct ktls_config *)mrb_calloc(mrb, 1, sizeof(*c));
-  struct RData *data =
-      mrb_data_object_alloc(mrb, mrb_class_ptr(klass), c, &ktls_config_type);
-
-  ktls_config_common(mrb, c);
-  c->chain = s2n_cert_chain_and_key_new();
-  if (c->chain == NULL) ktls_s2n_raise(mrb, "s2n_cert_chain_and_key_new");
-  if (s2n_cert_chain_and_key_load_pem_bytes(c->chain, (uint8_t *)cert, (uint32_t)certlen,
-                                            (uint8_t *)key, (uint32_t)keylen) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "load_pem");
-  }
-  if (s2n_config_add_cert_chain_and_key_to_store(c->cfg, c->chain) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "add_cert_chain");
-  }
-  return mrb_obj_value(data);
+  ktls_keys *k = ktls_keys_server(cert, (size_t) certlen, key, (size_t) keylen);
+  if (k == NULL) ktls_raise(mrb);
+  return mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(klass), k, &keys_type));
 }
 
-/* KTLS::Config.client - for now trust is DISABLED (loopback tests,
- * pinned deployments do their own checks). Verification arrives with
- * a trust-store API, named here so nobody mistakes this for one. */
-static mrb_value
-ktls_config_client(mrb_state *mrb, mrb_value klass)
+/* KTLS::Keys.client - no trust store, for loopback tests and pinned
+ * deployments that verify themselves. */
+static mrb_value keys_client(mrb_state *mrb, mrb_value klass)
 {
-  struct ktls_config *c = (struct ktls_config *)mrb_calloc(mrb, 1, sizeof(*c));
-  struct RData *data =
-      mrb_data_object_alloc(mrb, mrb_class_ptr(klass), c, &ktls_config_type);
-  ktls_config_common(mrb, c);
-  if (s2n_config_disable_x509_verification(c->cfg) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "disable_x509_verification");
-  }
-  return mrb_obj_value(data);
+  ktls_keys *k = ktls_keys_client();
+  if (k == NULL) ktls_raise(mrb);
+  return mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(klass), k, &keys_type));
 }
 
-/* config.policy = "..." - an s2n security-policy name, overriding the
- * default. The default REQUIRES TLS 1.3 (AWS-CRT-SDK-TLSv1.3); pick a
- * weaker lane only knowing why. */
-static mrb_value
-ktls_config_policy_set(mrb_state *mrb, mrb_value self)
+/* keys.alpn = ["h2", "http/1.1"] - order is preference. */
+static mrb_value keys_alpn_set(mrb_state *mrb, mrb_value self)
 {
-  const char *name;
-  mrb_get_args(mrb, "z", &name);
-  struct ktls_config *c = (struct ktls_config *)mrb_data_get_ptr(mrb, self, &ktls_config_type);
-  if (s2n_config_set_cipher_preferences(c->cfg, name) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "set_cipher_preferences");
+  mrb_value list;
+  mrb_get_args(mrb, "A", &list);
+
+  const mrb_int n = RARRAY_LEN(list);
+  if (n <= 0 || n > 8) mrb_raise(mrb, E_ARGUMENT_ERROR, "one to eight protocol names");
+  const char *names[8];
+  for (mrb_int i = 0; i < n; i++) {
+    names[i] = mrb_string_cstr(mrb, mrb_ary_entry(list, i));
   }
+  if (ktls_keys_set_alpn(keys_of(mrb, self), names, (size_t) n) != 0) ktls_raise(mrb);
+  return list;
+}
+
+/* keys.ciphers = "TLS_AES_128_GCM_SHA256:..." - overrides the order
+ * this machine would have chosen. */
+static mrb_value keys_ciphers_set(mrb_state *mrb, mrb_value self)
+{
+  const char *suites;
+  mrb_get_args(mrb, "z", &suites);
+  if (ktls_keys_set_ciphers(keys_of(mrb, self), suites) != 0) ktls_raise(mrb);
+  return mrb_str_new_cstr(mrb, suites);
+}
+
+/* ---- KTLS::Exchange ----------------------------------------------- */
+
+static void exchange_free(mrb_state *mrb, void *p)
+{
+  (void) mrb;
+  ktls_exchange_free((ktls_exchange *) p);
+}
+
+static const struct mrb_data_type exchange_type = { "KTLS::Exchange", exchange_free };
+
+static ktls_exchange *exchange_of(mrb_state *mrb, mrb_value self)
+{
+  return (ktls_exchange *) mrb_data_get_ptr(mrb, self, &exchange_type);
+}
+
+static ktls_direction direction_of(mrb_state *mrb, mrb_sym d)
+{
+  if (d == MRB_SYM(tx)) return KTLS_TX;
+  if (d == MRB_SYM(rx)) return KTLS_RX;
+  mrb_raise(mrb, E_ARGUMENT_ERROR, "direction must be :tx or :rx");
+  return KTLS_TX; /* not reached */
+}
+
+/* KTLS::Exchange.new(keys, :server | :client). No descriptor: the
+ * bytes cross through #feed and #take, so the socket stays whoever's
+ * it was. */
+static mrb_value exchange_init(mrb_state *mrb, mrb_value self)
+{
+  mrb_value keysv;
+  mrb_sym role;
+  mrb_get_args(mrb, "on", &keysv, &role);
+
+  ktls_role r;
+  if (role == MRB_SYM(server)) r = KTLS_SERVER;
+  else if (role == MRB_SYM(client)) r = KTLS_CLIENT;
+  else mrb_raise(mrb, E_ARGUMENT_ERROR, "role must be :server or :client");
+
+  ktls_exchange *x = ktls_exchange_open(keys_of(mrb, keysv), r);
+  if (x == NULL) ktls_raise(mrb);
+  mrb_data_init(self, x, &exchange_type);
+  /* The keys must outlive the exchange; the C side holds a pointer. */
+  mrb_iv_set(mrb, self, MRB_IVSYM(keys), keysv);
   return self;
 }
 
-/* Connection */
-
-struct ktls_conn {
-  struct s2n_connection *conn;
-};
-
-static void
-ktls_conn_free(mrb_state *mrb, void *p)
+static mrb_value exchange_feed(mrb_state *mrb, mrb_value self)
 {
-  struct ktls_conn *c = (struct ktls_conn *)p;
-  if (c == NULL) return;
-  if (c->conn != NULL) s2n_connection_free(c->conn);
-  mrb_free(mrb, c);
-}
-
-static const struct mrb_data_type ktls_conn_type = {"KTLS::Connection", ktls_conn_free};
-
-/* KTLS::Connection.new(config, io, :server | :client). The fd goes
- * O_NONBLOCK here: this API is shaped for a reactor, negotiate steps
- * and never sleeps (self-service blinding for the same reason). */
-static mrb_value
-ktls_conn_init(mrb_state *mrb, mrb_value self)
-{
-  mrb_value cfgv, io;
-  mrb_sym mode;
-  mrb_get_args(mrb, "oon", &cfgv, &io, &mode);
-  struct ktls_config *cfg =
-      (struct ktls_config *)mrb_data_get_ptr(mrb, cfgv, &ktls_config_type);
-
-  s2n_mode m;
-  if (mode == MRB_SYM(server)) m = S2N_SERVER;
-  else if (mode == MRB_SYM(client)) m = S2N_CLIENT;
-  else mrb_raise(mrb, E_ARGUMENT_ERROR, "mode must be :server or :client");
-
-  struct ktls_conn *c = (struct ktls_conn *)mrb_calloc(mrb, 1, sizeof(*c));
-  mrb_data_init(self, c, &ktls_conn_type);
-
-  c->conn = s2n_connection_new(m);
-  if (c->conn == NULL) ktls_s2n_raise(mrb, "s2n_connection_new");
-  if (s2n_connection_set_config(c->conn, cfg->cfg) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "set_config");
-  }
-  if (s2n_connection_set_blinding(c->conn, S2N_SELF_SERVICE_BLINDING) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "set_blinding");
-  }
-  const int fd = ktls_fileno(mrb, io);
-  const int fl = fcntl(fd, F_GETFL, 0);
-  if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) mrb_sys_fail(mrb, "O_NONBLOCK");
-  /* Nagle holds the second of s2n's CCS+Finished writes hostage to a
-   * delayed ACK - found as a live stall: a nonblocking stepper spins
-   * its budget away in microseconds while 58 bytes sit in the kernel
-   * for 40ms. Handshake messages are latency traffic; NODELAY is the
-   * correct posture and best-effort (non-TCP fds refuse, fine). */
-  const int one = 1;
-  (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  if (s2n_connection_set_fd(c->conn, fd) != S2N_SUCCESS) ktls_s2n_raise(mrb, "set_fd");
-  /* The config must outlive the connection; s2n holds a pointer. */
-  mrb_iv_set(mrb, self, MRB_IVSYM(config), cfgv);
-  return self;
-}
-
-static mrb_value
-ktls_blocked_sym(mrb_state *mrb, s2n_blocked_status blocked)
-{
-  switch (blocked) {
-    case S2N_NOT_BLOCKED: return mrb_symbol_value(MRB_SYM(done));
-    case S2N_BLOCKED_ON_READ: return mrb_symbol_value(MRB_SYM(reading));
-    case S2N_BLOCKED_ON_WRITE: return mrb_symbol_value(MRB_SYM(writing));
-    default: return mrb_symbol_value(MRB_SYM(blocked));
-  }
-}
-
-/* conn.negotiate -> :done | :reading | :writing. Call again when the
- * fd is ready in the named direction; raises on real failure. */
-static mrb_value
-ktls_conn_negotiate(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  s2n_blocked_status blocked = S2N_NOT_BLOCKED;
-  if (s2n_negotiate(c->conn, &blocked) != S2N_SUCCESS) {
-    if (s2n_error_get_type(s2n_errno) != S2N_ERR_T_BLOCKED) {
-      ktls_s2n_raise(mrb, "s2n_negotiate");
-    }
-  }
-  return ktls_blocked_sym(mrb, blocked);
-}
-
-/* conn.version -> :tls13 (or what else was negotiated). */
-static mrb_value
-ktls_conn_version(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  switch (s2n_connection_get_actual_protocol_version(c->conn)) {
-    case S2N_TLS13: return mrb_symbol_value(MRB_SYM(tls13));
-    case S2N_TLS12: return mrb_symbol_value(MRB_SYM(tls12));
-    case S2N_TLS11: return mrb_symbol_value(MRB_SYM(tls11));
-    case S2N_TLS10: return mrb_symbol_value(MRB_SYM(tls10));
-    default: return mrb_nil_value();
-  }
-}
-
-/* conn.shutdown -> :done | :reading | :writing. Steps a clean TLS
- * shutdown (close_notify both ways, RFC 8446 6.1); call again when
- * the fd is ready. KTLS::Socket#close drives it best-effort. */
-static mrb_value
-ktls_conn_shutdown(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  s2n_blocked_status blocked = S2N_NOT_BLOCKED;
-  if (s2n_shutdown(c->conn, &blocked) != S2N_SUCCESS) {
-    if (s2n_error_get_type(s2n_errno) != S2N_ERR_T_BLOCKED) {
-      ktls_s2n_raise(mrb, "s2n_shutdown");
-    }
-  }
-  return ktls_blocked_sym(mrb, blocked);
-}
-
-/* KTLS.dup_fd(fd) -> Integer. KTLS::Socket.attach adopts a COPY of
- * the caller's fd (dup), so both objects own their descriptor and
- * either may close without killing the other. */
-static mrb_value
-ktls_dup_fd(mrb_state *mrb, mrb_value self)
-{
-  mrb_int fd;
-  mrb_get_args(mrb, "i", &fd);
-  const int nfd = dup((int)fd);
-  if (nfd < 0) mrb_sys_fail(mrb, "dup");
-  return mrb_fixnum_value(nfd);
-}
-
-/* conn.cipher -> the negotiated cipher's IANA name. The caller needs
- * it to know which encryption limit applies to raw-fd sends after the
- * handover: AES-GCM ~388GB per direction per key, CHACHA20-POLY1305
- * practically none. */
-static mrb_value
-ktls_conn_cipher(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  const char *name = s2n_connection_get_cipher(c->conn);
-  if (name == NULL) return mrb_nil_value();
-  return mrb_str_new_cstr(mrb, name);
-}
-
-/* conn.enable_ktls_send / conn.enable_ktls_recv - the handover. After both, the
- * fd's plain send/recv are TLS and s2n is out of the data path. */
-static void
-ktls_require_initialized(mrb_state *mrb)
-{
-  if (!ktls_initialized()) {
-    mrb_raise(mrb, E_RUNTIME_ERROR,
-              "kTLS is not initialized (tls module not loaded) - load it "
-              "deliberately: modprobe tls, or KTLS.try_enable");
-  }
-}
-
-static mrb_value
-ktls_conn_ktls_send(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  ktls_require_initialized(mrb);
-  if (s2n_connection_ktls_enable_send(c->conn) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "ktls_enable_send");
-  }
-  return self;
-}
-
-static mrb_value
-ktls_conn_ktls_recv(mrb_state *mrb, mrb_value self)
-{
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  ktls_require_initialized(mrb);
-  if (s2n_connection_ktls_enable_recv(c->conn) != S2N_SUCCESS) {
-    ktls_s2n_raise(mrb, "ktls_enable_recv");
-  }
-  return self;
-}
-
-/* Pre-handover I/O through s2n, for the tiers (and tests) that speak
- * before or without kTLS. Returns [bytes_or_string, status]. */
-static mrb_value
-ktls_conn_send(mrb_state *mrb, mrb_value self)
-{
-  char *buf;
+  char *bytes;
   mrb_int len;
-  mrb_get_args(mrb, "s", &buf, &len);
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  s2n_blocked_status blocked = S2N_NOT_BLOCKED;
-  const ssize_t n = s2n_send(c->conn, buf, (ssize_t)len, &blocked);
-  if (n < 0 && s2n_error_get_type(s2n_errno) != S2N_ERR_T_BLOCKED) {
-    ktls_s2n_raise(mrb, "s2n_send");
+  mrb_get_args(mrb, "s", &bytes, &len);
+  if (ktls_exchange_feed(exchange_of(mrb, self), bytes, (size_t) len) != 0) ktls_raise(mrb);
+  return mrb_fixnum_value(len);
+}
+
+/* Everything owed to the peer, as one String. "" when nothing is. */
+static mrb_value exchange_take(mrb_state *mrb, mrb_value self)
+{
+  ktls_exchange *x = exchange_of(mrb, self);
+  mrb_value out = mrb_str_new(mrb, NULL, 0);
+  char buf[16384];
+  for (;;) {
+    const size_t n = ktls_exchange_take(x, buf, sizeof(buf));
+    if (n == 0) break;
+    out = mrb_str_cat(mrb, out, buf, n);
   }
-  mrb_value pair = mrb_ary_new_capa(mrb, 2);
-  mrb_ary_push(mrb, pair, mrb_fixnum_value(n < 0 ? 0 : n));
-  mrb_ary_push(mrb, pair, ktls_blocked_sym(mrb, blocked));
-  return pair;
+  return out;
 }
 
-static mrb_value
-ktls_conn_recv(mrb_state *mrb, mrb_value self)
+/* :done | :reading | :writing */
+static mrb_value exchange_step(mrb_state *mrb, mrb_value self)
 {
-  mrb_int len;
-  mrb_get_args(mrb, "i", &len);
-  if (len <= 0) mrb_raise(mrb, E_ARGUMENT_ERROR, "length must be positive");
-  struct ktls_conn *c = (struct ktls_conn *)mrb_data_get_ptr(mrb, self, &ktls_conn_type);
-  mrb_value out = mrb_str_new(mrb, NULL, len);
-  s2n_blocked_status blocked = S2N_NOT_BLOCKED;
-  const ssize_t n = s2n_recv(c->conn, RSTRING_PTR(out), (ssize_t)len, &blocked);
-  if (n < 0 && s2n_error_get_type(s2n_errno) != S2N_ERR_T_BLOCKED) {
-    ktls_s2n_raise(mrb, "s2n_recv");
+  ktls_step step = KTLS_READING;
+  if (ktls_exchange_step(exchange_of(mrb, self), &step) != 0) ktls_raise(mrb);
+  switch (step) {
+    case KTLS_DONE: return mrb_symbol_value(MRB_SYM(done));
+    case KTLS_WRITING: return mrb_symbol_value(MRB_SYM(writing));
+    default: return mrb_symbol_value(MRB_SYM(reading));
   }
-  mrb_str_resize(mrb, out, n < 0 ? 0 : n);
-  mrb_value pair = mrb_ary_new_capa(mrb, 2);
-  mrb_ary_push(mrb, pair, out);
-  mrb_ary_push(mrb, pair, ktls_blocked_sym(mrb, blocked));
-  return pair;
 }
 
-void
-mrb_mruby_ktls_gem_init(mrb_state *mrb)
+/* Application bytes that arrived in the same flight as the peer's
+ * Finished, and - on either side - the post-handshake records that
+ * have to be consumed before the record sequence is read. */
+static mrb_value exchange_backlog(mrb_state *mrb, mrb_value self)
 {
-  /* Process-wide, once; s2n refuses double init and cleanup belongs
-   * to process exit (multiple mrb_states share the library state). */
-  static int s2n_ready = 0;
-  if (!s2n_ready) {
-    if (s2n_init() != S2N_SUCCESS) {
-      mrb_raisef(mrb, E_RUNTIME_ERROR, "s2n_init: %s", s2n_strerror(s2n_errno, "EN"));
-    }
-    s2n_ready = 1;
+  ktls_exchange *x = exchange_of(mrb, self);
+  mrb_value out = mrb_str_new(mrb, NULL, 0);
+  char buf[16384];
+  for (;;) {
+    const size_t n = ktls_exchange_backlog(x, buf, sizeof(buf));
+    if (n == 0) break;
+    out = mrb_str_cat(mrb, out, buf, n);
   }
-
-  struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
-                                MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(available), ktls_available_p,
-                                MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(try_enable), ktls_try_enable,
-                                MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_ulp, MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, m, MRB_SYM(dup_fd), ktls_dup_fd, MRB_ARGS_REQ(1));
-
-  struct RClass *cfg = mrb_define_class_under_id(mrb, m, MRB_SYM(Config), mrb->object_class);
-  MRB_SET_INSTANCE_TT(cfg, MRB_TT_DATA);
-  mrb_undef_class_method_id(mrb, cfg, MRB_SYM(new));
-  mrb_define_class_method_id(mrb, cfg, MRB_SYM(server), ktls_config_server, MRB_ARGS_REQ(2));
-  mrb_define_class_method_id(mrb, cfg, MRB_SYM(client), ktls_config_client, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cfg, MRB_SYM_E(policy), ktls_config_policy_set, MRB_ARGS_REQ(1));
-
-  struct RClass *cn =
-      mrb_define_class_under_id(mrb, m, MRB_SYM(Connection), mrb->object_class);
-  MRB_SET_INSTANCE_TT(cn, MRB_TT_DATA);
-  mrb_define_method_id(mrb, cn, MRB_SYM(initialize), ktls_conn_init, MRB_ARGS_REQ(3));
-  mrb_define_method_id(mrb, cn, MRB_SYM(negotiate), ktls_conn_negotiate, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(version), ktls_conn_version, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(cipher), ktls_conn_cipher, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(shutdown), ktls_conn_shutdown, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(enable_ktls_send), ktls_conn_ktls_send, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(enable_ktls_recv), ktls_conn_ktls_recv, MRB_ARGS_NONE());
-  mrb_define_method_id(mrb, cn, MRB_SYM(send), ktls_conn_send, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, cn, MRB_SYM(recv), ktls_conn_recv, MRB_ARGS_REQ(1));
+  return out;
 }
 
-void
-mrb_mruby_ktls_gem_final(mrb_state *mrb)
+static mrb_value exchange_alpn(mrb_state *mrb, mrb_value self)
 {
+  size_t len = 0;
+  const char *name = ktls_exchange_alpn(exchange_of(mrb, self), &len);
+  return name == NULL ? mrb_nil_value() : mrb_str_new(mrb, name, len);
 }
 
-#else /* !__linux__ */
-
-static mrb_value
-ktls_enabled_p(mrb_state *mrb, mrb_value self)
+static mrb_value exchange_cipher(mrb_state *mrb, mrb_value self)
 {
-  return mrb_false_value();
+  const char *name = ktls_exchange_cipher(exchange_of(mrb, self));
+  return name == NULL ? mrb_nil_value() : mrb_str_new_cstr(mrb, name);
 }
 
-static mrb_value
-ktls_notimp(mrb_state *mrb, mrb_value self)
+/* The setsockopt payload for one direction, as a String - so a caller
+ * that submits its own setsockopt (over io_uring, against a direct
+ * descriptor) has the exact bytes. Read it LAST. */
+static mrb_value exchange_crypto_info(mrb_state *mrb, mrb_value self)
 {
-  mrb_raise(mrb, E_NOTIMP_ERROR, "kTLS is a Linux socket ULP");
-  return mrb_nil_value(); /* not reached */
+  mrb_sym dir;
+  mrb_get_args(mrb, "n", &dir);
+  size_t len = 0;
+  const void *info = ktls_crypto_info(exchange_of(mrb, self), direction_of(mrb, dir), &len);
+  if (info == NULL) ktls_raise(mrb);
+  return mrb_str_new(mrb, (const char *) info, len);
 }
 
-void
-mrb_mruby_ktls_gem_init(mrb_state *mrb)
+static mrb_value exchange_record_sequence(mrb_state *mrb, mrb_value self)
+{
+  mrb_sym dir;
+  mrb_get_args(mrb, "n", &dir);
+  return mrb_int_value(
+      mrb, (mrb_int) ktls_record_sequence(exchange_of(mrb, self), direction_of(mrb, dir)));
+}
+
+static mrb_value exchange_record_limit(mrb_state *mrb, mrb_value self)
+{
+  return mrb_int_value(mrb, (mrb_int) ktls_record_limit(exchange_of(mrb, self)));
+}
+
+/* RFC 8446 4.6.3: turn the secret one notch. The kernel's sequence
+ * restarts at zero and the caller re-installs the crypto_info. */
+static mrb_value exchange_next_key(mrb_state *mrb, mrb_value self)
+{
+  mrb_sym dir;
+  mrb_get_args(mrb, "n", &dir);
+  if (ktls_next_key(exchange_of(mrb, self), direction_of(mrb, dir)) != 0) ktls_raise(mrb);
+  return self;
+}
+
+/* ULP plus both directions on a descriptor this process holds. */
+static mrb_value exchange_offload(mrb_state *mrb, mrb_value self)
+{
+  mrb_value io;
+  mrb_get_args(mrb, "o", &io);
+  const mrb_int fd =
+      mrb_integer(mrb_type_convert(mrb, io, MRB_TT_INTEGER, MRB_SYM(fileno)));
+  if (ktls_offload(exchange_of(mrb, self), (int) fd) != 0) ktls_raise(mrb);
+  return self;
+}
+
+/* ---- the module -------------------------------------------------- */
+
+static mrb_value m_initialized(mrb_state *mrb, mrb_value self)
+{
+  (void) mrb; (void) self;
+  return mrb_bool_value(ktls_initialized());
+}
+
+static mrb_value m_available(mrb_state *mrb, mrb_value self)
+{
+  (void) mrb; (void) self;
+  return mrb_bool_value(ktls_available());
+}
+
+static mrb_value m_aes_fast(mrb_state *mrb, mrb_value self)
+{
+  (void) mrb; (void) self;
+  return mrb_bool_value(ktls_aes_is_fast());
+}
+
+static mrb_value m_load_module(mrb_state *mrb, mrb_value self)
+{
+  (void) self;
+  if (ktls_load_module() != 0) ktls_raise(mrb);
+  return mrb_true_value();
+}
+
+static mrb_value m_attach_ulp(mrb_state *mrb, mrb_value self)
+{
+  (void) self;
+  mrb_value io;
+  mrb_get_args(mrb, "o", &io);
+  const mrb_int fd =
+      mrb_integer(mrb_type_convert(mrb, io, MRB_TT_INTEGER, MRB_SYM(fileno)));
+  if (ktls_attach_ulp((int) fd) != 0) ktls_raise(mrb);
+  return io;
+}
+
+void mrb_mruby_ktls_gem_init(mrb_state *mrb)
 {
   struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(KTLS));
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(enabled), ktls_enabled_p,
-                                MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(available), ktls_enabled_p,
-                                MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(try_enable), ktls_notimp, MRB_ARGS_NONE());
-  mrb_define_module_function_id(mrb, m, MRB_SYM(ulp), ktls_notimp, MRB_ARGS_REQ(1));
+  mrb_define_class_under_id(mrb, m, MRB_SYM(Error), mrb->eStandardError_class);
+
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(initialized), m_initialized, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(available), m_available, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM_Q(aes_fast), m_aes_fast, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(load_module), m_load_module, MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, m, MRB_SYM(attach_ulp), m_attach_ulp, MRB_ARGS_REQ(1));
+
+  /* The socket option level and names, so a caller can submit the
+   * setsockopt itself instead of going through #offload. */
+  mrb_define_const_id(mrb, m, MRB_SYM(SOL_TLS), mrb_fixnum_value(ktls_sol_tls()));
+  mrb_define_const_id(mrb, m, MRB_SYM(TLS_TX), mrb_fixnum_value(ktls_optname(KTLS_TX)));
+  mrb_define_const_id(mrb, m, MRB_SYM(TLS_RX), mrb_fixnum_value(ktls_optname(KTLS_RX)));
+
+  struct RClass *keys = mrb_define_class_under_id(mrb, m, MRB_SYM(Keys), mrb->object_class);
+  MRB_SET_INSTANCE_TT(keys, MRB_TT_DATA);
+  mrb_undef_class_method_id(mrb, keys, MRB_SYM(new));
+  mrb_define_class_method_id(mrb, keys, MRB_SYM(server), keys_server, MRB_ARGS_REQ(2));
+  mrb_define_class_method_id(mrb, keys, MRB_SYM(client), keys_client, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, keys, MRB_SYM_E(alpn), keys_alpn_set, MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, keys, MRB_SYM_E(ciphers), keys_ciphers_set, MRB_ARGS_REQ(1));
+
+  struct RClass *x = mrb_define_class_under_id(mrb, m, MRB_SYM(Exchange), mrb->object_class);
+  MRB_SET_INSTANCE_TT(x, MRB_TT_DATA);
+  mrb_define_method_id(mrb, x, MRB_SYM(initialize), exchange_init, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, x, MRB_SYM(feed), exchange_feed, MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, x, MRB_SYM(take), exchange_take, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(step), exchange_step, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(backlog), exchange_backlog, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(alpn), exchange_alpn, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(cipher), exchange_cipher, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(crypto_info), exchange_crypto_info, MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, x, MRB_SYM(record_sequence), exchange_record_sequence,
+                       MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, x, MRB_SYM(record_limit), exchange_record_limit, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, x, MRB_SYM(next_key), exchange_next_key, MRB_ARGS_REQ(1));
+  mrb_define_method_id(mrb, x, MRB_SYM(offload), exchange_offload, MRB_ARGS_REQ(1));
 }
 
-void
-mrb_mruby_ktls_gem_final(mrb_state *mrb)
+void mrb_mruby_ktls_gem_final(mrb_state *mrb)
 {
+  (void) mrb;
 }
-
-#endif

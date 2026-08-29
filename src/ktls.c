@@ -18,6 +18,19 @@
 #endif
 #include <unistd.h>
 
+#include <openssl/opensslv.h>
+
+/* EVP_KDF "TLS13-KDF" is the whole key schedule this file leans on and
+ * it arrived in OpenSSL 3.0. LibreSSL reports 0x20000000 here and has
+ * neither that nor kTLS, which is why the acme process - whose libcurl
+ * brings whatever TLS the distribution shipped - is a process of its
+ * own and not this one. */
+#if defined(LIBRESSL_VERSION_NUMBER)
+#error "ktls needs OpenSSL >= 3.0; this is LibreSSL, which has no TLS13-KDF and no kTLS"
+#elif OPENSSL_VERSION_NUMBER < 0x30000000L
+#error "ktls needs OpenSSL >= 3.0 for EVP_KDF TLS13-KDF"
+#endif
+
 #include <openssl/bio.h>
 #include <openssl/core_names.h>
 #include <openssl/err.h>
@@ -34,7 +47,18 @@
  * sequence that starts at zero for the first application record. */
 #define KTLS_SECRET_MAX 64
 
-static _Thread_local char ktls_err[256];
+/* Spelled per language rather than as C11's keyword: this file is
+ * built by a C compiler in the gem and by a C++ one where an embedder
+ * drops it into its own build. */
+#if defined(__cplusplus)
+#define KTLS_PER_THREAD thread_local
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define KTLS_PER_THREAD _Thread_local
+#else
+#define KTLS_PER_THREAD __thread
+#endif
+
+static KTLS_PER_THREAD char ktls_err[256];
 
 static void ktls_fail(const char *what)
 {
@@ -265,7 +289,7 @@ int ktls_keys_set_alpn(ktls_keys *keys, const char *const *protocols, size_t cou
 ktls_keys *ktls_keys_server(const char *cert_pem, size_t cert_len,
                             const char *key_pem, size_t key_len)
 {
-  ktls_keys *keys = calloc(1, sizeof(*keys));
+  ktls_keys *keys = (ktls_keys *) calloc(1, sizeof(*keys));
   if (keys == NULL) { ktls_say("out of memory"); return NULL; }
   keys->ctx = ktls_ctx_new();
   if (keys->ctx == NULL) { free(keys); return NULL; }
@@ -280,7 +304,7 @@ ktls_keys *ktls_keys_server(const char *cert_pem, size_t cert_len,
 
 ktls_keys *ktls_keys_client(void)
 {
-  ktls_keys *keys = calloc(1, sizeof(*keys));
+  ktls_keys *keys = (ktls_keys *) calloc(1, sizeof(*keys));
   if (keys == NULL) { ktls_say("out of memory"); return NULL; }
   keys->ctx = ktls_ctx_new();
   if (keys->ctx == NULL) { free(keys); return NULL; }
@@ -310,6 +334,13 @@ struct ktls_records {
   bool overflowed;
 };
 
+/* The one blob setsockopt takes, in whichever shape the cipher has. */
+union ktls_info {
+  struct tls_crypto_info head;
+  struct tls12_crypto_info_aes_gcm_128 aes;
+  struct tls12_crypto_info_chacha20_poly1305 chacha;
+};
+
 struct ktls_exchange {
   SSL *ssl;
   BIO *in;   /* what arrived from the peer */
@@ -333,11 +364,7 @@ struct ktls_exchange {
   unsigned char secret[2][KTLS_SECRET_MAX];
   size_t secret_len[2];
   int cipher;  /* TLS_CIPHER_AES_GCM_128 or TLS_CIPHER_CHACHA20_POLY1305 */
-  union ktls_info {
-    struct tls_crypto_info head;
-    struct tls12_crypto_info_aes_gcm_128 aes;
-    struct tls12_crypto_info_chacha20_poly1305 chacha;
-  } info[2];
+  union ktls_info info[2];
 };
 
 static void ktls_scan(struct ktls_records *r, const unsigned char *p, size_t n)
@@ -408,7 +435,7 @@ static int ktls_unhex(const char *hex, unsigned char *out, size_t cap, size_t *l
  * them is ours to send with depends on which side we are. */
 static void ktls_keylog(const SSL *ssl, const char *line)
 {
-  struct ktls_exchange *x = SSL_get_ex_data(ssl, ktls_ex_index());
+  struct ktls_exchange *x = (struct ktls_exchange *) SSL_get_ex_data(ssl, ktls_ex_index());
   if (x == NULL) return;
 
   static const char kClient[] = "CLIENT_TRAFFIC_SECRET_0 ";
@@ -433,7 +460,7 @@ ktls_exchange *ktls_exchange_open(ktls_keys *keys, ktls_role role)
 {
   if (keys == NULL) { ktls_say("ktls_exchange_open: no keys"); return NULL; }
 
-  ktls_exchange *x = calloc(1, sizeof(*x));
+  ktls_exchange *x = (ktls_exchange *) calloc(1, sizeof(*x));
   if (x == NULL) { ktls_say("out of memory"); return NULL; }
 
   x->ssl = SSL_new(keys->ctx);
@@ -473,7 +500,7 @@ int ktls_exchange_feed(ktls_exchange *x, const void *bytes, size_t len)
     ktls_fail("BIO_write");
     return -1;
   }
-  ktls_scan(&x->rx, bytes, len);
+  ktls_scan(&x->rx, (const unsigned char *) bytes, len);
   x->rx_fed += len;
   return 0;
 }
@@ -482,7 +509,7 @@ size_t ktls_exchange_take(ktls_exchange *x, void *out, size_t cap)
 {
   const int n = BIO_read(x->out, out, (int) cap);
   if (n <= 0) return 0;
-  ktls_scan(&x->tx, out, (size_t) n);
+  ktls_scan(&x->tx, (const unsigned char *) out, (size_t) n);
   return (size_t) n;
 }
 
@@ -673,6 +700,9 @@ uint64_t ktls_record_sequence(const ktls_exchange *cx, ktls_direction dir)
 {
   ktls_exchange *x = (ktls_exchange *) cx;
   if (!x->done) return 0;
+  const int server = SSL_is_server(x->ssl);
+  const int which = (dir == KTLS_TX) ? (server ? 1 : 0) : (server ? 0 : 1);
+  if (x->rekeyed[which]) return 0;
   const uint64_t consumed = x->rx_fed - (uint64_t) BIO_pending(x->in);
   return (dir == KTLS_TX) ? ktls_records_between(&x->tx, x->tx_at_done, x->tx.offset)
                           : ktls_records_between(&x->rx, x->rx_at_done, consumed);

@@ -1,48 +1,64 @@
+require 'fileutils'
+
 MRuby::Gem::Specification.new('mruby-ktls') do |spec|
   spec.license = 'Apache-2'
   spec.author  = 'Hendrik Beskow'
-  spec.summary = 'kTLS for mruby: an s2n-tls handshake that hands the wire to the kernel'
+  spec.summary = 'kTLS for mruby: agree keys, hand them to the kernel, get out of the way'
 
-  # The Amazon stack, built to the MINIMUM that carries kTLS: AWS-LC's
-  # libcrypto (its libssl is never built - s2n is the TLS layer) and
-  # s2n-tls, both static, both pinned as submodules. cmake runs once
-  # per build dir; a warm rebuild costs a stat.
-  if ENV['OS'] != 'Windows_NT'
-    awslc = "#{dir}/deps/aws-lc"
-    s2n   = "#{dir}/deps/s2n-tls"
-    bdir  = "#{build_dir}/deps"
-    libcrypto = "#{bdir}/aws-lc/crypto/libcrypto.a"
-    libs2n    = "#{bdir}/s2n/lib/libs2n.a"
-    prefix    = "#{bdir}/prefix"
+  # include/ktls.h and include/ktls.hpp are the whole surface. mruby
+  # puts a gem's include/ on every dependent's compiler path, so a C or
+  # C++ gem that depends on this one has them without saying so;
+  # export_include_paths carries them to mruby-config users too.
+  spec.export_include_paths << "#{spec.dir}/include"
 
-    unless File.file?(libcrypto)
-      sh %(cmake -S "#{awslc}" -B "#{bdir}/aws-lc" -DCMAKE_BUILD_TYPE=Release ) +
-         %(-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DDISABLE_GO=ON ) +
-         %(-DDISABLE_PERL=ON -DBUILD_TOOL=OFF >/dev/null)
-      sh %(cmake --build "#{bdir}/aws-lc" --target crypto -j#{`nproc`.strip} >/dev/null)
-    end
-    unless File.file?(libs2n)
-      # s2n finds libcrypto through a prefix; stage the crypto-only
-      # slice of AWS-LC as one (headers straight from the source tree,
-      # which ships them pregenerated).
-      FileUtils.mkdir_p ["#{prefix}/lib", "#{prefix}/include"]
-      FileUtils.cp libcrypto, "#{prefix}/lib/"
-      FileUtils.cp_r "#{awslc}/include/openssl", "#{prefix}/include/", remove_destination: true
-      sh %(cmake -S "#{s2n}" -B "#{bdir}/s2n" -DCMAKE_BUILD_TYPE=Release ) +
-         %(-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF ) +
-         %(-DCMAKE_PREFIX_PATH="#{prefix}" >/dev/null)
-      sh %(cmake --build "#{bdir}/s2n" -j#{`nproc`.strip} >/dev/null)
+  # OpenSSL >= 3.0, vendored and built here, because the answer to
+  # "which crypto library is on this machine" is not one a server may
+  # depend on: openSUSE ships LibreSSL, which has neither EVP_KDF
+  # TLS13-KDF nor kTLS, and Ubuntu's OpenSSL 3.0.13 is built without
+  # kTLS at all (its libssl.so.3 exports no ktls symbol). src/ktls.c
+  # refuses to compile against either, by #error and by name.
+  #
+  # SHARED on purpose: the process that speaks TLS is not the process
+  # that serves HTTP (see README, "Four processes"), and a shared
+  # object is what lets the two link different crypto without meeting.
+  if RUBY_PLATFORM !~ /mswin|mingw|windows/
+    ossl_src = "#{dir}/deps/openssl"
+    unless File.file?("#{ossl_src}/Configure")
+      raise "[mruby-ktls] deps/openssl is empty - run: git submodule update --init --depth 1"
     end
 
-    spec.cc.include_paths << "#{s2n}/api"
-    # Order matters: s2n resolves into crypto.
-    spec.linker.flags_after_libraries += [libs2n, libcrypto]
+    ossl = "#{build_dir}/openssl"
+    libssl = "#{ossl}/libssl.so"
+
+    # Out of tree, so the submodule stays pristine and a second build
+    # config does not fight this one over generated headers.
+    #
+    # The no- list is what "only the part we need" means for OpenSSL:
+    # the knobs are the supported granularity, a source-level slice is
+    # not. TLS 1.3 is the only protocol this tree speaks.
+    unless File.file?(libssl)
+      FileUtils.mkdir_p(ossl)
+      Dir.chdir(ossl) do
+        sh "perl #{ossl_src}/Configure shared enable-ktls " \
+           "no-tests no-docs no-dtls no-ssl3 no-tls1 no-tls1_1 " \
+           "no-comp no-engine no-dso no-legacy no-deprecated no-quic " \
+           "no-ssl-trace no-uplink > configure.log 2>&1"
+        sh "make -j#{`nproc`.strip} build_libs >> configure.log 2>&1"
+      end
+    end
+
+    spec.cc.include_paths  << "#{ossl}/include" << "#{ossl_src}/include"
+    spec.cxx.include_paths << "#{ossl}/include" << "#{ossl_src}/include"
+    # RPATH so the binary finds the .so beside itself rather than the
+    # distribution's - which is the whole point of vendoring it.
+    spec.linker.flags_after_libraries += [
+      "-L#{ossl}", '-lssl', '-lcrypto',
+      "-Wl,-rpath,#{ossl}", "-Wl,-rpath,\\$ORIGIN/../lib"
+    ]
   end
 
-  # KTLS::Socket subclasses TCPSocket (mrblib/ktls_socket.rb): the
-  # socket API is the product surface, not just a test convenience.
-  spec.add_dependency 'mruby-io'
-  spec.add_dependency 'mruby-socket'
-  spec.add_dependency 'mruby-errno'
-  spec.add_test_dependency 'mruby-string-ext'
+  spec.add_dependency 'mruby-io',    core: 'mruby-io'
+  spec.add_dependency 'mruby-error', core: 'mruby-error'
+  spec.add_test_dependency 'mruby-socket', core: 'mruby-socket'
+  spec.add_test_dependency 'mruby-string-ext', core: 'mruby-string-ext'
 end

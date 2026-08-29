@@ -1,160 +1,169 @@
 # mruby-ktls
 
-A TLS handshake that exists only to hand the wire to the kernel.
+Agree keys, hand them to the kernel, get out of the way.
 
-The stack is Amazon's, built to the **minimum that carries kTLS**:
-[AWS-LC](https://github.com/aws/aws-lc)'s libcrypto (its libssl is
-never built - s2n is the TLS layer) under
-[s2n-tls](https://github.com/aws/s2n-tls), both static, both pinned as
-submodules. After `negotiate` the kernel takes the record layer
-(`s2n_connection_ktls_enable_send/recv`) and the socket speaks plain
-`send`/`recv` - or io_uring submissions - while s2n leaves the data
-path.
+This library never touches a socket. It is fed the bytes that arrived
+and hands back the bytes that must go out, so whoever owns the
+descriptor keeps owning it — io_uring submissions against a direct
+descriptor included. When the exchange is done it produces the two
+`crypto_info` blobs the kernel wants, and from the `setsockopt` that
+carries them **the kernel is the record layer**: plain `send`/`recv`
+are TLS, and nothing here sits in the data path.
 
-## KTLS::Socket - the socket API, subclassed
+```c
+ktls_keys *k = ktls_keys_server(cert, clen, key, klen);
+ktls_keys_set_alpn(k, (const char *[]){ "h2", "http/1.1" }, 2);
 
-For everyone who just wants a socket: `KTLS::Socket < TCPSocket`
-adopts an existing connection and replaces ONLY what must stay under
-s2n's eyes - `#write` routes through `s2n_send` (after the handover
-that submits through the OFFLOADED socket: kernel crypto, record
-accounting, KeyUpdates when due), `#recv` through `s2n_recv` (an
-incoming KeyUpdate is processed, not EIO). Everything else is
-inherited untouched; `IO.select` works because the fd is real. The
-three caveats from the table below dissolve here by construction.
+ktls_exchange *x = ktls_exchange_open(k, KTLS_SERVER);   /* no descriptor */
+ktls_exchange_feed(x, from_peer, n);                     /* what came in  */
+ktls_exchange_step(x, &step);                            /* DONE | READING | WRITING */
+ktls_exchange_take(x, buf, sizeof buf);                  /* what must go out */
 
-```ruby
-tls = KTLS::Socket.attach(sock, config, :server)  # adopts a dup of the fd
-tls.handshake                  # blocking convenience; steps, then hands
-                               # over where KTLS.enabled?
-tls.write("hello")             # kernel-encrypted when KTLS.enabled?
-line = tls.recv(4096)
-tls.close                      # close_notify, then the fd
+ktls_exchange_backlog(x, buf, sizeof buf);               /* drain, both sides */
+const void *tx = ktls_crypto_info(x, KTLS_TX, &len);     /* read LAST */
+ktls_exchange_free(x);                                   /* done for good */
 ```
 
-The kTLS capability surface lives whole on the module - THREE
-methods (see "Nothing loads automatically"): `KTLS.enabled?`,
-`KTLS.available?`, `KTLS.try_enable`. The socket keeps no state
-mirror: s2n itself knows whether it is offloaded and routes
-accordingly - the API stays identical either way.
-
-Reactors use `#handshake_step` (or `KTLS::Connection` directly) and
-keep the raw-fd escape - with its duties.
-
-## Shape
-
-Made for a one-thread nonblocking reactor: the fd goes `O_NONBLOCK`
-at attach, `negotiate` steps and never sleeps (self-service blinding),
-and both ends of a handshake can be driven from a single thread.
+Three languages, one surface: `include/ktls.h` for C, `include/ktls.hpp`
+for C++ (move-only handles, no exceptions, every method one call deep),
+and `KTLS::Keys` / `KTLS::Exchange` for Ruby. `src/mrb_ktls.c` is a
+caller like any other.
 
 ```ruby
-scfg = KTLS::Config.server(cert_pem, key_pem)
-# TLS 1.3 is MANDATORY by default (policy AWS-CRT-SDK-TLSv1.3,
-# minimum 1.3); #policy= overrides, knowing why.
+keys = KTLS::Keys.server(cert_pem, key_pem)
+keys.alpn = %w[h2 http/1.1]
 
-conn = KTLS::Connection.new(scfg, sock, :server)
-loop do
-  case conn.negotiate
-  when :done    then break
-  when :reading then wait_readable(sock)   # your reactor's wait
-  when :writing then wait_writable(sock)
-  end
+x = KTLS::Exchange.new(keys, :server)
+x.feed(bytes_from_peer)
+case x.step
+when :done then # ...
+when :reading, :writing then # ...
 end
-
-conn.enable_ktls_send   # the kernel owns the send path now
-conn.enable_ktls_recv   # ... and the receive path
-sock.write(bytes)  # a plain write IS a TLS record from here on
+x.take                       # String, "" when nothing is owed
+x.backlog                    # drain on BOTH sides before the next line
+x.crypto_info(:tx)           # the setsockopt payload, as bytes
 ```
 
-`KTLS::Connection#send/#recv` speak through s2n for whatever runs
-before - or without - the handover.
+## The order, and why it is an order
 
-Needing no keys and no s2n: the three capability methods below, and
-`KTLS.ulp(io)` attaching the ULP raw.
+```
+step  until :done       — :done only comes when take owes nothing
+backlog                 — on BOTH sides
+crypto_info             — the sequence is settled here
+setsockopt              — ULP, then TLS_TX and TLS_RX
+free
+```
 
-## Nothing loads automatically
+Each line is a trap the type system cannot close:
 
-Setting `TCP_ULP` to `"tls"` makes the kernel **autoload** the `tls`
-module on hosts that ship it as one. A library must never change
-kernel state because someone asked a question - so the capability
-surface is three module methods, and only the third changes
-anything:
+- **`:done` waits for `take`.** Bytes still owed are ciphertext OpenSSL
+  already produced under the handshake keys. The kernel would encrypt
+  them a second time.
+- **`backlog` on both sides.** RFC 8446 4.6.1 lets a peer put
+  application data in the same flight as its Finished, and a server
+  writes its NewSessionTickets right after the handshake. Those are
+  records under the application key; a side that has not consumed them
+  disagrees with the other about where the record sequence stands.
+- **`crypto_info` last.** A TLS 1.3 key change resets the sequence, so
+  the kernel is told where the application keys already stood. Getting
+  this wrong is nonce reuse, not a wrong answer.
 
-- `KTLS.enabled?` - loaded AND active right now? Passive: reads the
-  `/proc/net/tls_stat` marker, which exists exactly when the tls
-  subsystem is initialized (module loaded, or built in). Asking
-  never changes the answer.
-- `KTLS.available?` - does THIS kernel ship the functionality,
-  loaded or not? Passive too: enabled counts, else the running
-  kernel's module index must list `net/tls/tls.ko` (`modules.dep` /
-  `modules.builtin`). False means `try_enable` cannot help.
-- `KTLS.try_enable` - the ONE deliberate loader: one `setsockopt`
-  on a dummy socket. The ULP lookup autoloads the module BEFORE the
-  ULP inspects the socket, and refusing the unconnected dummy
-  (ENOTCONN) is the success sound - the module is loaded, nothing
-  was touched but that. Raises with errno when the kernel cannot
-  (ENOENT: no tls ULP, no module to load). `modprobe tls` outside
-  the process works just as well.
-- Everything that would trigger the autoload as a side effect -
-  `KTLS.ulp`, `enable_ktls_send`, `enable_ktls_recv` - refuses by
-  name when the subsystem is not initialized ("kTLS is not
-  initialized (tls module not loaded) - load it deliberately:
-  modprobe tls, or KTLS.try_enable") instead of loading it for you.
+## What it speaks
 
-## Scope lines
+TLS 1.3, and two suites that both hash with SHA-256:
 
-- **Client verification is currently DISABLED** (`KTLS::Config.client`
-  is for loopback tests and pinned deployments that verify
-  themselves). A trust-store API is the next slab; nothing here
-  pretends to be one.
-- TLS 1.3 is mandatory, and s2n's ONLY 1.3 handover path is
-  `s2n_config_ktls_enable_unsafe_tls13`. That call is not the absence
-  of KeyUpdate support - it IS s2n's KeyUpdate-over-kTLS machinery
-  (send a KeyUpdate through the offloaded socket and re-setsockopt
-  TLS_TX; process a received one and re-setsockopt TLS_RX). "unsafe"
-  labels three caveats, all about raw-fd use, and the embedder owns
-  them here - decided knowingly:
+| | `TLS_AES_128_GCM_SHA256` | `TLS_CHACHA20_POLY1305_SHA256` |
+|---|---|---|
+| kernel kTLS | yes | yes |
+| NIC offload (`ethtool tls-hw-tx-offload`) | **yes** | no |
+| without AES instructions | slower, and timing-sensitive | constant-time by construction |
+| records under one key | 2^24.5 (RFC 8446 5.5) | none anyone reaches |
 
-  | Caveat | Owner's duty |
-  |---|---|
-  | AES-GCM key limit (~388GB/direction) counted only for s2n_send traffic | Cap bytes per connection below the limit, or prefer CHACHA20-POLY1305 (`Connection#cipher` says which applies) |
-  | Incoming KeyUpdate = EIO on a raw read | Treat as end of connection (errors kill the connection, never the process) |
-  | Re-key needs a second setsockopt | Kernel >= 6.14 |
-- `Connection.new` sets `TCP_NODELAY` (best-effort): Nagle holds the
-  second of s2n's CCS+Finished writes hostage to a delayed ACK, and a
-  nonblocking stepper spins its budget away in microseconds while 58
-  bytes sit in the kernel for 40ms. Found as a live stall, kept as a
-  sentence.
-- Why kTLS at all, measured on the old tree: throughput parity with
-  userspace TLS, RSS is the win, and splice into a kTLS socket works -
-  file bodies never touch userspace.
+AES first where the machine has the instructions, ChaCha first
+otherwise; `ktls_keys_set_ciphers` overrides. `TLS_AES_256_GCM_SHA384`
+is not offered: 14 rounds instead of 10 for security nobody can reach,
+and it would have dragged SHA-384 into the key schedule.
 
-## Not AF_ALG
+A KeyUpdate costs the 32 bytes of secret the exchange still holds and
+nothing else — `ktls_next_key` turns it one notch with RFC 8446 7.2's
+`"traffic upd"` label. That is what makes AES-GCM's limit answerable
+rather than fatal.
 
-kTLS is often confused with the kernel's OTHER crypto interface.
-AF_ALG (`CONFIG_CRYPTO_USER_API`) is the generic crypto socket API -
-deprecated for Linux 7.2 after a steady CVE stream ("Copy Fail",
-CVE-2026-31431, sat in `algif_aead`), and already disabled by
-distributions. kTLS is the TLS ULP (`CONFIG_TLS`), a separate
-subsystem that calls kernel crypto internally and takes no AF_ALG
-detour. `CRYPTO_USER_API=n` with `CONFIG_TLS=y` is exactly the
-intended pairing: their door closed, this one open.
+## Reading a kernel-owned socket
 
-## Requirements
+**Never a plain `recv`.** A record that is not application data — an
+alert, a KeyUpdate — surfaces as `EIO` there. Read with `recvmsg` and
+take the type out of its `TLS_GET_RECORD_TYPE` control message: 23 is
+data, 21 an alert, 22 a KeyUpdate to answer. Writing one is the mirror,
+`TLS_SET_RECORD_TYPE` on a `sendmsg`, which is also how `close_notify`
+goes out without this library.
 
-Linux with `CONFIG_TLS` for the handover (asked passively at runtime,
-never assumed - and never autoloaded, see above); the s2n handshake
-itself runs anywhere Linux. Non-Linux compiles: `enabled?` answers
-`false`, operations raise `NotImplementedError`. Build needs cmake
-(AWS-LC ships pregenerated sources; no Go, no Perl).
+## Why OpenSSL, and why >= 3.0
+
+Measured, not assumed:
+
+- **s2n-tls** cannot hand ChaCha to the kernel at all.
+  `tls/s2n_ktls.c` requires `cipher->set_ktls_info`, and
+  `crypto/s2n_aead_cipher_aes_gcm.c` is the only file that defines one
+   — in the current pin and in upstream `main`.
+- **mbedTLS** has no kTLS code: no hit for `ktls`, `kernel_tls` or
+  `TCP_ULP` anywhere in its tree. The key export callback is there, but
+  `mbedtls_ssl_tls13_make_traffic_keys` is in a private header.
+- **The system OpenSSL is not dependable.** openSUSE ships LibreSSL,
+  which has neither `EVP_KDF` TLS13-KDF nor kTLS. Ubuntu ships OpenSSL
+  3.0.13 whose `libssl.so.3` exports **no** ktls symbol — kTLS is off
+  by default before 3.2, and `BIO_get_ktls_send` is a macro that
+  compiles to `(0)`, so a build without it fails silently. `src/ktls.c`
+  refuses both, by `#error` and by name.
+
+So OpenSSL is vendored (`deps/openssl`) and built here, **shared** on
+purpose — see below.
+
+## Four processes
+
+The process that strangers send requests to holds no keys.
+
+```
+supervisor
+├── logd        no crypto
+├── acme        mruby-url over the system libcurl, whatever TLS the distro has
+├── ktls        this library, OpenSSL >= 3, holds the keys and the secrets
+└── webserver   no crypto at all
+```
+
+`ktls` accepts, runs the exchange, installs ULP + `TLS_TX` + `TLS_RX`
+on its own direct descriptor, and pushes that descriptor into the
+webserver's ring with `IORING_OP_MSG_RING` / `MSG_SEND_FD` — table to
+table, no fd number in either process, ALPN riding along as the
+message's data. It keeps its own slot, so when the webserver sees a
+record of type 22 it sends one `MSG_DATA` back saying which connection
+needs its keys turned.
+
+`acme` is a process of its own because its libcurl brings the
+distribution's TLS, and two libcryptos in one address space is a bug
+waiting for a link order.
 
 ## Tests
 
-`rake test` clones mruby master and proves: `enabled?` answers
-without loading anything, a loopback handshake completes
-single-threaded and stepped, application data round-trips through
-s2n, the handover paths refuse by name where the tls subsystem is
-not initialized, and - where it is - a plain socket write after
-`enable_ktls_send` arrives as a valid TLS record.
+`rake test` proves the Ruby surface. `examples/ktls_c_api.c` and
+`examples/ktls_cpp_api.cpp` prove the other two, running a whole exchange
+between two objects in one thread with no socket anywhere — the check
+that carries the rest is that the server's SEND blob **is** the
+client's RECEIVE blob, byte for byte, before and after a key update,
+under both suites.
+
+`examples/ktls_handover.c` is the half those cannot reach: it needs a
+kernel with `CONFIG_TLS`, opens a real loopback pair, hands both
+sockets over, frees everything, and then writes plaintext through.
+
+```sh
+cc -std=c11 -D_GNU_SOURCE -O2 -o ktls_handover \
+   examples/ktls_handover.c src/ktls.c -Iinclude $(pkg-config --cflags --libs openssl)
+./ktls_handover
+```
+
+It exits 77 and says so where there is no tls ULP, rather than claiming
+anything.
 
 ## License
 
