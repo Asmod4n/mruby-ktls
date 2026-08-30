@@ -471,6 +471,13 @@ struct ktls_exchange {
   struct ktls_records tx, rx;
   uint64_t tx_at_done, rx_at_done;
   uint64_t rx_fed;
+  /* Written down at KTLS_DONE, because ktls_exchange_release frees the
+   * SSL these three would otherwise be asked for - and a connection
+   * that can no longer say who it is cannot answer a KeyUpdate. */
+  bool server;
+  char cipher_name[40];
+  unsigned char alpn[32];
+  size_t alpn_len;
   /* A key update restarts the kernel's sequence at zero, and from
    * there the records are the kernel's to count, not ours. */
   bool rekeyed[2];
@@ -603,6 +610,15 @@ ktls_exchange *ktls_exchange_open(ktls_keys *keys, ktls_role role)
   return x;
 }
 
+void ktls_exchange_release(ktls_exchange *x)
+{
+  if (x == NULL || x->ssl == NULL) return;
+  SSL_free(x->ssl); /* frees both BIOs */
+  x->ssl = NULL;
+  x->in = NULL;
+  x->out = NULL;
+}
+
 void ktls_exchange_free(ktls_exchange *x)
 {
   if (x == NULL) return;
@@ -613,8 +629,18 @@ void ktls_exchange_free(ktls_exchange *x)
   free(x);
 }
 
+/* Everything below this line needs the SSL, so each says so rather
+ * than reaching through a pointer ktls_exchange_release set to NULL. */
+static bool ktls_still_has_ssl(const ktls_exchange *x, const char *what)
+{
+  if (x->ssl != NULL) return true;
+  ktls_say(what);
+  return false;
+}
+
 int ktls_exchange_feed(ktls_exchange *x, const void *bytes, size_t len)
 {
+  if (!ktls_still_has_ssl(x, "feed after the exchange was released")) return -1;
   if (len == 0) return 0;
   if (BIO_write(x->in, bytes, (int) len) != (int) len) {
     ktls_fail("BIO_write");
@@ -627,6 +653,7 @@ int ktls_exchange_feed(ktls_exchange *x, const void *bytes, size_t len)
 
 size_t ktls_exchange_take(ktls_exchange *x, void *out, size_t cap)
 {
+  if (!ktls_still_has_ssl(x, "take after the exchange was released")) return 0;
   const int n = BIO_read(x->out, out, (int) cap);
   if (n <= 0) return 0;
   ktls_scan(&x->tx, (const unsigned char *) out, (size_t) n);
@@ -733,6 +760,7 @@ static int ktls_derive_both(struct ktls_exchange *x)
 
 int ktls_exchange_step(ktls_exchange *x, ktls_step *step)
 {
+  if (!ktls_still_has_ssl(x, "step after the exchange was released")) return -1;
   if (!x->done) {
     const int rc = SSL_do_handshake(x->ssl);
     if (rc != 1) {
@@ -753,8 +781,22 @@ int ktls_exchange_step(ktls_exchange *x, ktls_step *step)
      * which counts. A client finishes BY writing its Finished, so the
      * record still pending is that one, which does not. */
     x->tx_at_done = x->tx.offset;
-    if (!SSL_is_server(x->ssl)) x->tx_at_done += (uint64_t) BIO_pending(x->out);
+    x->server = SSL_is_server(x->ssl) != 0;
+    if (!x->server) x->tx_at_done += (uint64_t) BIO_pending(x->out);
     x->rx_at_done = x->rx_fed - (uint64_t) BIO_pending(x->in);
+
+    const SSL_CIPHER *suite = SSL_get_current_cipher(x->ssl);
+    const char *suite_name = suite != NULL ? SSL_CIPHER_get_name(suite) : NULL;
+    if (suite_name != NULL) {
+      snprintf(x->cipher_name, sizeof(x->cipher_name), "%s", suite_name);
+    }
+    const unsigned char *chosen = NULL;
+    unsigned int chosen_len = 0;
+    SSL_get0_alpn_selected(x->ssl, &chosen, &chosen_len);
+    if (chosen != NULL && chosen_len != 0 && chosen_len <= sizeof(x->alpn)) {
+      memcpy(x->alpn, chosen, chosen_len);
+      x->alpn_len = chosen_len;
+    }
     x->done = true;
   }
   /* KTLS_DONE only once nothing is owed. Bytes still sitting here are
@@ -767,12 +809,9 @@ int ktls_exchange_step(ktls_exchange *x, ktls_step *step)
 
 const char *ktls_exchange_alpn(const ktls_exchange *x, size_t *len)
 {
-  const unsigned char *name = NULL;
-  unsigned int n = 0;
-  SSL_get0_alpn_selected(x->ssl, &name, &n);
-  if (name == NULL || n == 0) return NULL;
-  *len = n;
-  return (const char *) name;
+  if (x->alpn_len == 0) return NULL;
+  *len = x->alpn_len;
+  return (const char *) x->alpn;
 }
 
 /* RFC 8446 4.6.1: a client may put application data in the same
@@ -783,6 +822,7 @@ const char *ktls_exchange_alpn(const ktls_exchange *x, size_t *len)
 size_t ktls_exchange_backlog(ktls_exchange *x, void *out, size_t cap)
 {
   if (!x->done) return 0;
+  if (!ktls_still_has_ssl(x, "backlog after the exchange was released")) return 0;
   const int n = SSL_read(x->ssl, out, (int) cap);
   return n > 0 ? (size_t) n : 0;
 }
@@ -803,13 +843,19 @@ const void *ktls_crypto_info(const ktls_exchange *cx, ktls_direction dir, size_t
     return NULL;
   }
 
-  const int server = SSL_is_server(x->ssl);
-  const int which = (dir == KTLS_TX) ? (server ? 1 : 0) : (server ? 0 : 1);
-  const uint64_t consumed = x->rx_fed - (uint64_t) BIO_pending(x->in);
-  const uint64_t seq = x->rekeyed[which] ? 0
-                       : (dir == KTLS_TX)
-                           ? ktls_records_between(&x->tx, x->tx_at_done, x->tx.offset)
-                           : ktls_records_between(&x->rx, x->rx_at_done, consumed);
+  const int which = (dir == KTLS_TX) ? (x->server ? 1 : 0) : (x->server ? 0 : 1);
+  /* A rekey restarts the kernel's sequence at zero and asks nothing of
+   * the BIOs - which is what lets this still answer after
+   * ktls_exchange_release has taken them away. */
+  uint64_t seq = 0;
+  if (!x->rekeyed[which]) {
+    if (dir == KTLS_TX) {
+      seq = ktls_records_between(&x->tx, x->tx_at_done, x->tx.offset);
+    } else {
+      const uint64_t consumed = x->rx_fed - (uint64_t) BIO_pending(x->in);
+      seq = ktls_records_between(&x->rx, x->rx_at_done, consumed);
+    }
+  }
 
   union ktls_info *ci = &x->info[which];
 #if defined(__FreeBSD__)
@@ -831,12 +877,11 @@ uint64_t ktls_record_sequence(const ktls_exchange *cx, ktls_direction dir)
 {
   ktls_exchange *x = (ktls_exchange *) cx;
   if (!x->done) return 0;
-  const int server = SSL_is_server(x->ssl);
-  const int which = (dir == KTLS_TX) ? (server ? 1 : 0) : (server ? 0 : 1);
+  const int which = (dir == KTLS_TX) ? (x->server ? 1 : 0) : (x->server ? 0 : 1);
   if (x->rekeyed[which]) return 0;
+  if (dir == KTLS_TX) return ktls_records_between(&x->tx, x->tx_at_done, x->tx.offset);
   const uint64_t consumed = x->rx_fed - (uint64_t) BIO_pending(x->in);
-  return (dir == KTLS_TX) ? ktls_records_between(&x->tx, x->tx_at_done, x->tx.offset)
-                          : ktls_records_between(&x->rx, x->rx_at_done, consumed);
+  return ktls_records_between(&x->rx, x->rx_at_done, consumed);
 }
 
 /* RFC 8446 7.2: application_traffic_secret_N+1 =
@@ -848,8 +893,7 @@ uint64_t ktls_record_sequence(const ktls_exchange *cx, ktls_direction dir)
 int ktls_next_key(ktls_exchange *x, ktls_direction dir)
 {
   if (!x->done) { ktls_say("the exchange has not finished"); return -1; }
-  const int server = SSL_is_server(x->ssl);
-  const int which = (dir == KTLS_TX) ? (server ? 1 : 0) : (server ? 0 : 1);
+  const int which = (dir == KTLS_TX) ? (x->server ? 1 : 0) : (x->server ? 0 : 1);
 
   unsigned char next[KTLS_SECRET_MAX];
   const size_t n = x->secret_len[which];
@@ -872,7 +916,8 @@ uint64_t ktls_record_limit(const ktls_exchange *x)
 
 const char *ktls_exchange_cipher(const ktls_exchange *x)
 {
-  const SSL_CIPHER *c = SSL_get_current_cipher(x->ssl);
+  if (x->cipher_name[0] != '\0') return x->cipher_name;
+  const SSL_CIPHER *c = x->ssl != NULL ? SSL_get_current_cipher(x->ssl) : NULL;
   return c != NULL ? SSL_CIPHER_get_name(c) : NULL;
 }
 
@@ -941,6 +986,7 @@ int ktls_offload(const ktls_exchange *x, int fd) { (void) x; (void) fd; return -
 uint64_t ktls_record_sequence(const ktls_exchange *x, ktls_direction d) { (void) x; (void) d; return 0; }
 bool ktls_aes_is_fast(void) { return false; }
 int ktls_keys_set_ciphers(ktls_keys *k, const char *s) { (void) k; (void) s; return -1; }
+void ktls_exchange_release(ktls_exchange *x) { (void) x; }
 int ktls_next_key(ktls_exchange *x, ktls_direction d) { (void) x; (void) d; return -1; }
 uint64_t ktls_record_limit(const ktls_exchange *x) { (void) x; return 0; }
 const char *ktls_exchange_cipher(const ktls_exchange *x) { (void) x; return NULL; }

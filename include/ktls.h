@@ -146,6 +146,20 @@ uint64_t ktls_record_sequence(const ktls_exchange *x, ktls_direction dir);
 /* The suite that was negotiated, by its IANA name. */
 const char *ktls_exchange_cipher(const ktls_exchange *x);
 
+/* Give up the SSL and its buffers - the largest thing an exchange
+ * holds - while keeping what a live connection still needs: the
+ * traffic secrets, so a KeyUpdate can be answered, and the negotiated
+ * cipher and ALPN, which are written down at KTLS_DONE for this.
+ *
+ * After it, feed, take, step and backlog all fail by name; crypto_info,
+ * record_sequence, record_limit, alpn, cipher and next_key go on
+ * answering. Call it once the handover is submitted and keep the
+ * exchange for as long as the connection lives. ktls_exchange_free is
+ * still what ends it.
+ *
+ * A caller that will never rekey may simply free instead. */
+void ktls_exchange_release(ktls_exchange *x);
+
 /* What a record on an offloaded socket turned out to be. A plain recv
  * answers EIO for anything but DATA and says no more than that. */
 typedef enum {

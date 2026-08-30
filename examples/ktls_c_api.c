@@ -166,6 +166,37 @@ int main(int argc, char **argv)
   ok(ktls_record_sequence(s, KTLS_TX) == 0,
      "which record_sequence says too - the blob and the getter agree");
 
+  /* The SSL goes; the connection stays rekeyable. This is what lets a
+     server hold a slot per peer without holding an SSL per peer. */
+  {
+    size_t alen = 0;
+    const char *alpn_before = ktls_exchange_alpn(s, &alen);
+    const char *suite_before = ktls_exchange_cipher(s);
+    char suite_kept[64];
+    snprintf(suite_kept, sizeof(suite_kept), "%s", suite_before ? suite_before : "");
+
+    ktls_exchange_release(s);
+    ok(ktls_exchange_cipher(s) != NULL && strcmp(ktls_exchange_cipher(s), suite_kept) == 0,
+       "after release the suite is still known");
+    size_t alen2 = 0;
+    const char *alpn_after = ktls_exchange_alpn(s, &alen2);
+    ok((alpn_before == NULL) == (alpn_after == NULL) && alen == alen2,
+       "and so is what ALPN settled on");
+    ok(ktls_exchange_step(s, NULL) == -1 && ktls_exchange_take(s, NULL, 0) == 0,
+       "but the handshake calls refuse by name");
+
+    size_t before_len = 0;
+    const void *before = ktls_crypto_info(s, KTLS_TX, &before_len);
+    unsigned char kept[64];
+    memcpy(kept, before, before_len);
+    ok(ktls_next_key(s, KTLS_TX) == 0, "a KeyUpdate is still answerable without the SSL");
+    size_t after_len = 0;
+    const void *after = ktls_crypto_info(s, KTLS_TX, &after_len);
+    ok(after != NULL && after_len == before_len && memcmp(after, kept, before_len) != 0,
+       "and it hands out a key the old one is not");
+    ok(ktls_record_sequence(s, KTLS_TX) == 0, "with the sequence back at zero");
+  }
+
   /* RFC 8446 5's ContentType, read the way a recvmsg control message
      hands it over. No socket and no kernel are needed to check the
      mapping itself, and the mapping is what a reactor bets on when it
