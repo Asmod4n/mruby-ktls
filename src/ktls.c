@@ -439,6 +439,15 @@ ktls_keys *ktls_keys_server(const char *cert_pem, size_t cert_len,
     free(keys);
     return NULL;
   }
+  /* A key that does not belong to the certificate is accepted by both
+   * calls above and refused by every handshake afterwards. Asked here,
+   * it is a startup failure with a name instead. */
+  if (SSL_CTX_check_private_key(keys->ctx) != 1) {
+    ktls_fail("the private key does not match the certificate");
+    SSL_CTX_free(keys->ctx);
+    free(keys);
+    return NULL;
+  }
   return keys;
 }
 
