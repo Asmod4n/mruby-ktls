@@ -325,10 +325,19 @@ bool ktls_aes_is_fast(void)
 /* Both suites hash with SHA-256, so the key schedule below needs no
  * second digest. TLS_AES_256_GCM_SHA384 would have brought one, for
  * 14 rounds instead of 10 and no reachable security gain.
- * AES-GCM would work over kTLS too, but its ~388GB-per-key limit has
- * to be counted by whoever writes the bytes - and after the handover
- * that is the kernel, which does not count for us. ChaCha has no
- * practical limit, so nobody has to. */
+ *
+ * Which of the two comes first is the machine's answer, and the order
+ * only means anything with SSL_OP_CIPHER_SERVER_PREFERENCE: for TLS
+ * 1.3 without it OpenSSL takes the CLIENT's order, so a server that
+ * spelled a preference got whatever the peer felt like. Measured
+ * against s_server both ways - server AES-first and client
+ * ChaCha-first negotiates ChaCha without the option and AES with it.
+ *
+ * AES-GCM carries RFC 8446 5.5's record limit, and after the handover
+ * the kernel writes the records, so the count belongs to whoever fed
+ * it: ktls_record_limit says how many, and every sendmsg is at least
+ * one record and at most ceil(len / 16384). A caller that does not
+ * count must ask for ChaCha, which has no limit anyone reaches. */
 static SSL_CTX *ktls_ctx_new(void)
 {
   SSL_CTX *ctx = SSL_CTX_new(TLS_method());
@@ -339,6 +348,8 @@ static SSL_CTX *ktls_ctx_new(void)
     SSL_CTX_free(ctx);
     return NULL;
   }
+  /* Without this the order below is a suggestion the peer may ignore. */
+  SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
   const char *suites = ktls_aes_is_fast()
                            ? "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256"
                            : "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256";
