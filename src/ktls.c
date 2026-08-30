@@ -94,6 +94,18 @@ const char *ktls_last_error(void)
   return ktls_err[0] != '\0' ? ktls_err : "no failure recorded";
 }
 
+/* RFC 8446 5: the ContentType a record carries, which is the same
+ * number on both kernels even though they deliver it differently. */
+static ktls_record ktls_record_of(unsigned type)
+{
+  switch (type) {
+    case 21: return KTLS_RECORD_ALERT;
+    case 22: return KTLS_RECORD_HANDSHAKE;
+    case 23: return KTLS_RECORD_DATA;
+    default: return KTLS_RECORD_UNKNOWN;
+  }
+}
+
 /* ---- what the kernel can do, asked without changing it ----------- */
 
 #if defined(__FreeBSD__)
@@ -142,6 +154,30 @@ int ktls_optname(ktls_direction dir)
   /* Receiving arrived after sending; without it this library refuses,
    * because half a socket is not an offer it makes. */
   return dir == KTLS_TX ? TCP_TXTLS_ENABLE : -1;
+#endif
+}
+
+int ktls_record_type_cmsg(void)
+{
+#ifdef TLS_GET_RECORD
+  return TLS_GET_RECORD;
+#else
+  return -1;
+#endif
+}
+
+/* A whole struct tls_get_record, of which one field is the answer. */
+ktls_record ktls_record_type(const void *cmsg_data, size_t len)
+{
+#ifdef TLS_GET_RECORD
+  struct tls_get_record got;
+  if (cmsg_data == NULL || len < sizeof got) return KTLS_RECORD_UNKNOWN;
+  memcpy(&got, cmsg_data, sizeof got);
+  return ktls_record_of(got.tls_type);
+#else
+  (void) cmsg_data;
+  (void) len;
+  return KTLS_RECORD_UNKNOWN;
 #endif
 }
 
@@ -220,6 +256,15 @@ int ktls_attach_ulp(int fd)
 
 int ktls_sol_tls(void) { return SOL_TLS; }
 int ktls_optname(ktls_direction dir) { return dir == KTLS_TX ? TLS_TX : TLS_RX; }
+
+int ktls_record_type_cmsg(void) { return TLS_GET_RECORD_TYPE; }
+
+/* One byte, and it is the RFC's own number. */
+ktls_record ktls_record_type(const void *cmsg_data, size_t len)
+{
+  if (cmsg_data == NULL || len < 1) return KTLS_RECORD_UNKNOWN;
+  return ktls_record_of(*(const unsigned char *) cmsg_data);
+}
 
 #endif
 

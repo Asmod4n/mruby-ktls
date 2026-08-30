@@ -146,12 +146,33 @@ uint64_t ktls_record_sequence(const ktls_exchange *x, ktls_direction dir);
 /* The suite that was negotiated, by its IANA name. */
 const char *ktls_exchange_cipher(const ktls_exchange *x);
 
+/* What a record on an offloaded socket turned out to be. A plain recv
+ * answers EIO for anything but DATA and says no more than that. */
+typedef enum {
+  KTLS_RECORD_DATA = 0,      /* application data: the stream itself */
+  KTLS_RECORD_ALERT = 1,     /* RFC 8446 6, close_notify among them */
+  KTLS_RECORD_HANDSHAKE = 2, /* post-handshake: a KeyUpdate, a ticket */
+  KTLS_RECORD_UNKNOWN = 3
+} ktls_record;
+
+/* The cmsg_type that carries it, and how to read it out of the control
+ * message's payload. Two calls rather than a constant because the two
+ * platforms disagree on both: Linux sends TLS_GET_RECORD_TYPE with one
+ * byte, FreeBSD sends TLS_GET_RECORD with a struct. A caller that uses
+ * these needs no <linux/tls.h> and no #ifdef.
+ *
+ * ktls_record_type answers KTLS_RECORD_UNKNOWN for a payload it cannot
+ * read, which is also the answer for a control message that was never
+ * there. */
+int ktls_record_type_cmsg(void);
+ktls_record ktls_record_type(const void *cmsg_data, size_t len);
+
 /* RFC 8446 4.6.3: a peer may send a KeyUpdate at any time, and a
- * kernel-owned socket surfaces it as a record of type 22 - which is
- * why the receive side has to be read with recvmsg and its
- * TLS_GET_RECORD_TYPE control message, never a plain recv. Turning
- * the secret one notch and re-installing the crypto_info for that
- * direction is the whole answer; the sequence restarts at zero. */
+ * kernel-owned socket surfaces it as KTLS_RECORD_HANDSHAKE - which is
+ * why the receive side has to be read with recvmsg and the control
+ * message above, never a plain recv. Turning the secret one notch and
+ * re-installing the crypto_info for that direction is the whole
+ * answer; the sequence restarts at zero. */
 int ktls_next_key(ktls_exchange *x, ktls_direction dir);
 
 /* How many records this cipher may encrypt under one key before that

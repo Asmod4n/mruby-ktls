@@ -103,6 +103,37 @@ static void drain(ktls_exchange *to, int fd)
   while (ktls_exchange_backlog(to, plain, sizeof(plain)) != 0) { }
 }
 
+/* RFC 8446 5: an offloaded socket answers EIO on a plain recv for
+ * anything that is not application data, and says no more than that.
+ * recvmsg carries the type in a control message instead, which is how
+ * a KeyUpdate stays answerable and a close_notify stays a close. */
+static ssize_t read_a_record(int fd, char *buf, size_t cap, ktls_record *type)
+{
+  char control[CMSG_SPACE(32)];
+  struct iovec iov;
+  struct msghdr msg;
+  struct cmsghdr *cm;
+
+  iov.iov_base = buf;
+  iov.iov_len = cap;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  const ssize_t n = recvmsg(fd, &msg, 0);
+  if (n < 0) return n;
+
+  *type = KTLS_RECORD_UNKNOWN;
+  for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+    if (cm->cmsg_level == ktls_sol_tls() && cm->cmsg_type == ktls_record_type_cmsg()) {
+      *type = ktls_record_type(CMSG_DATA(cm), (size_t) (cm->cmsg_len - CMSG_LEN(0)));
+    }
+  }
+  return n;
+}
+
 int main(int argc, char **argv)
 {
   size_t clen = 0, klen = 0;
@@ -179,16 +210,19 @@ int main(int argc, char **argv)
      "a PLAIN write on the client socket");
 
   char got[512];
-  const ssize_t n = read(sfd, got, sizeof(got));
+  ktls_record type = KTLS_RECORD_UNKNOWN;
+  const ssize_t n = read_a_record(sfd, got, sizeof(got), &type);
   ok(n == (ssize_t) sizeof(kHello) - 1 && memcmp(got, kHello, (size_t) n) == 0,
      "arrives as itself on the server socket - encrypted by the kernel");
+  ok(type == KTLS_RECORD_DATA, "and recvmsg says which kind of record it was");
 
   static const char kBack[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
   ok(write(sfd, kBack, sizeof(kBack) - 1) == (ssize_t) sizeof(kBack) - 1,
      "and a plain write back");
-  const ssize_t m = read(cfd, got, sizeof(got));
+  const ssize_t m = read_a_record(cfd, got, sizeof(got), &type);
   ok(m == (ssize_t) sizeof(kBack) - 1 && memcmp(got, kBack, (size_t) m) == 0,
      "arrives on the client - both directions are the kernel's now");
+  ok(type == KTLS_RECORD_DATA, "that one too");
 
   close(cfd);
   close(sfd);

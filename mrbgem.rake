@@ -28,6 +28,10 @@ MRuby::Gem::Specification.new('mruby-ktls') do |spec|
     inc = VendoredOpenSSL.include_paths(ossl_src, ossl)
     spec.cc.include_paths  += inc
     spec.cxx.include_paths += inc
+    # A gem that depends on this one links the same libcrypto, so it
+    # sees the same headers - two of either in one address space is a
+    # bug waiting for a link order.
+    spec.export_include_paths += inc
     # RPATH so the binary finds the .so beside itself rather than the
     # distribution's - which is the whole point of vendoring it.
     spec.linker.flags_after_libraries += [

@@ -166,6 +166,20 @@ int main(int argc, char **argv)
   ok(ktls_record_sequence(s, KTLS_TX) == 0,
      "which record_sequence says too - the blob and the getter agree");
 
+  /* RFC 8446 5's ContentType, read the way a recvmsg control message
+     hands it over. No socket and no kernel are needed to check the
+     mapping itself, and the mapping is what a reactor bets on when it
+     decides that a record is the stream rather than an alert. */
+  {
+    const unsigned char data = 23, alert = 21, handshake = 22, nonsense = 99;
+    ok(ktls_record_type_cmsg() > 0, "the control message that carries a record's type has a name");
+    ok(ktls_record_type(&data, 1) == KTLS_RECORD_DATA, "23 is application data");
+    ok(ktls_record_type(&alert, 1) == KTLS_RECORD_ALERT, "21 is an alert");
+    ok(ktls_record_type(&handshake, 1) == KTLS_RECORD_HANDSHAKE, "22 is post-handshake");
+    ok(ktls_record_type(&nonsense, 1) == KTLS_RECORD_UNKNOWN, "anything else is unknown");
+    ok(ktls_record_type(NULL, 0) == KTLS_RECORD_UNKNOWN, "and so is a message that was not there");
+  }
+
   /* The refusal, where the tls subsystem is not initialized. */
   if (!ktls_initialized()) {
     ok(ktls_offload(s, 0) == -1, "ktls_offload refuses by name without the tls module");
