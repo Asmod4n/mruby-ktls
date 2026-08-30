@@ -209,6 +209,14 @@ int main(int argc, char **argv)
     ok(ktls_record_type(&handshake, 1) == KTLS_RECORD_HANDSHAKE, "22 is post-handshake");
     ok(ktls_record_type(&nonsense, 1) == KTLS_RECORD_UNKNOWN, "anything else is unknown");
     ok(ktls_record_type(NULL, 0) == KTLS_RECORD_UNKNOWN, "and so is a message that was not there");
+
+    /* And the way back, for the one record a server spells itself. */
+    unsigned char spelled = 0;
+    ok(ktls_record_type_set_cmsg() > 0, "the control message that SETS a type has one too");
+    ok(ktls_record_type_encode(KTLS_RECORD_ALERT, &spelled, 1) == 1 && spelled == alert,
+       "an alert is spelled back to the number it was read from");
+    ok(ktls_record_type_encode(KTLS_RECORD_UNKNOWN, &spelled, 1) == 0,
+       "and a kind with no number is refused rather than guessed");
   }
 
   /* The refusal, where the tls subsystem is not initialized. */

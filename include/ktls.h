@@ -181,6 +181,17 @@ typedef enum {
 int ktls_record_type_cmsg(void);
 ktls_record ktls_record_type(const void *cmsg_data, size_t len);
 
+/* And the same in the other direction, for the one record this side
+ * spells deliberately: RFC 8446 6.1's close_notify, which a peer needs
+ * in order to tell a finished stream from a truncated one. The kernel
+ * encrypts whatever type it is told, so this needs no library beyond
+ * the two names - the cmsg_type to set, and the payload for a kind.
+ *
+ * ktls_record_type_encode writes that payload and returns its length,
+ * or 0 for a kind this platform will not let a caller send. */
+int ktls_record_type_set_cmsg(void);
+size_t ktls_record_type_encode(ktls_record kind, void *out, size_t cap);
+
 /* RFC 8446 4.6.3: a peer may send a KeyUpdate at any time, and a
  * kernel-owned socket surfaces it as KTLS_RECORD_HANDSHAKE - which is
  * why the receive side has to be read with recvmsg and the control

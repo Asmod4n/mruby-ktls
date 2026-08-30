@@ -106,6 +106,26 @@ static ktls_record ktls_record_of(unsigned type)
   }
 }
 
+/* The way back. Both kernels take the ContentType as one byte here,
+ * however differently they report it. */
+static int ktls_type_of(ktls_record kind)
+{
+  switch (kind) {
+    case KTLS_RECORD_ALERT: return 21;
+    case KTLS_RECORD_HANDSHAKE: return 22;
+    case KTLS_RECORD_DATA: return 23;
+    default: return -1;
+  }
+}
+
+size_t ktls_record_type_encode(ktls_record kind, void *out, size_t cap)
+{
+  const int type = ktls_type_of(kind);
+  if (type < 0 || out == NULL || cap < 1) return 0;
+  *(unsigned char *) out = (unsigned char) type;
+  return 1;
+}
+
 /* ---- what the kernel can do, asked without changing it ----------- */
 
 #if defined(__FreeBSD__)
@@ -161,6 +181,15 @@ int ktls_record_type_cmsg(void)
 {
 #ifdef TLS_GET_RECORD
   return TLS_GET_RECORD;
+#else
+  return -1;
+#endif
+}
+
+int ktls_record_type_set_cmsg(void)
+{
+#ifdef TLS_SET_RECORD_TYPE
+  return TLS_SET_RECORD_TYPE;
 #else
   return -1;
 #endif
@@ -258,6 +287,7 @@ int ktls_sol_tls(void) { return SOL_TLS; }
 int ktls_optname(ktls_direction dir) { return dir == KTLS_TX ? TLS_TX : TLS_RX; }
 
 int ktls_record_type_cmsg(void) { return TLS_GET_RECORD_TYPE; }
+int ktls_record_type_set_cmsg(void) { return TLS_SET_RECORD_TYPE; }
 
 /* One byte, and it is the RFC's own number. */
 ktls_record ktls_record_type(const void *cmsg_data, size_t len)
