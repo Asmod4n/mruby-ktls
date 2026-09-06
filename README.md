@@ -1,33 +1,33 @@
 # mruby-ktls
 
-Agree keys, hand them to the kernel, get out of the way.
+Agree TLS 1.3 keys, hand them to the kernel, get out of the way.
 
-This library never touches a socket. It is fed the bytes that arrived
-and hands back the bytes that must go out, so whoever owns the
-descriptor keeps owning it — io_uring submissions against a direct
-descriptor included. When the exchange is done it produces the two
-`crypto_info` blobs the kernel wants, and from the `setsockopt` that
-carries them **the kernel is the record layer**: plain `send`/`recv`
-are TLS, and nothing here sits in the data path.
+This library never touches a socket. It takes the bytes that arrived and
+returns the bytes that must go out. At the end it produces the two
+`crypto_info` blobs for `setsockopt`, and from there the kernel is the
+record layer: plain `send` and `recv` are TLS.
+
+## Surface
+
+C — `include/ktls.h`:
 
 ```c
 ktls_keys *k = ktls_keys_server(cert, clen, key, klen);
 ktls_keys_set_alpn(k, (const char *[]){ "h2", "http/1.1" }, 2);
 
-ktls_exchange *x = ktls_exchange_open(k, KTLS_SERVER);   /* no descriptor */
-ktls_exchange_feed(x, from_peer, n);                     /* what came in  */
-ktls_exchange_step(x, &step);                            /* DONE | READING | WRITING */
-ktls_exchange_take(x, buf, sizeof buf);                  /* what must go out */
+ktls_exchange *x = ktls_exchange_open(k, KTLS_SERVER);
+ktls_exchange_feed(x, from_peer, n);
+ktls_exchange_step(x, &step);          /* DONE | READING | WRITING */
+ktls_exchange_take(x, buf, sizeof buf);
 
-ktls_exchange_backlog(x, buf, sizeof buf);               /* drain, both sides */
-const void *tx = ktls_crypto_info(x, KTLS_TX, &len);     /* read LAST */
-ktls_exchange_free(x);                                   /* done for good */
+ktls_exchange_backlog(x, buf, sizeof buf);
+ktls_offload(x, fd);                   /* or ktls_crypto_info for your own reactor */
+ktls_exchange_free(x);
 ```
 
-Three languages, one surface: `include/ktls.h` for C, `include/ktls.hpp`
-for C++ (move-only handles, no exceptions, every method one call deep),
-and `KTLS::Keys` / `KTLS::Exchange` for Ruby. `src/mrb_ktls.c` is a
-caller like any other.
+C++ — `include/ktls.hpp`: move-only handles, no exceptions.
+
+Ruby — `KTLS::Keys` and `KTLS::Exchange`:
 
 ```ruby
 keys = KTLS::Keys.server(cert_pem, key_pem)
@@ -35,134 +35,45 @@ keys.alpn = %w[h2 http/1.1]
 
 x = KTLS::Exchange.new(keys, :server)
 x.feed(bytes_from_peer)
-case x.step
-when :done then # ...
-when :reading, :writing then # ...
-end
+x.step                       # :done, :reading, :writing
 x.take                       # String, "" when nothing is owed
-x.backlog                    # drain on BOTH sides before the next line
-x.crypto_info(:tx)           # the setsockopt payload, as bytes
+x.backlog                    # drain on both sides before the handover
+x.crypto_info(:tx)           # the setsockopt payload
 ```
 
-## The order, and why it is an order
+## Rules
 
-```
-step  until :done       — :done only comes when take owes nothing
-backlog                 — on BOTH sides
-crypto_info             — the sequence is settled here
-setsockopt              — ULP, then TLS_TX and TLS_RX
-free
-```
-
-Each line is a trap the type system cannot close:
-
-- **`:done` waits for `take`.** Bytes still owed are ciphertext OpenSSL
-  already produced under the handshake keys. The kernel would encrypt
-  them a second time.
-- **`backlog` on both sides.** RFC 8446 4.6.1 lets a peer put
-  application data in the same flight as its Finished, and a server
-  writes its NewSessionTickets right after the handshake. Those are
-  records under the application key; a side that has not consumed them
-  disagrees with the other about where the record sequence stands.
-- **`crypto_info` last.** A TLS 1.3 key change resets the sequence, so
-  the kernel is told where the application keys already stood. Getting
-  this wrong is nonce reuse, not a wrong answer.
+- `take` after every `step`, including one that answers `:reading`.
+- `backlog` after `:done`, on both sides, before `crypto_info`.
+- `crypto_info` last.
+- Read a kernel-owned socket with `recvmsg`, never `recv`: 23 is data,
+  21 an alert, 22 a KeyUpdate. `ktls_record_type` reads the control
+  message; `ktls_next_key` answers a KeyUpdate.
 
 ## What it speaks
 
-TLS 1.3, and two suites that both hash with SHA-256:
+TLS 1.3 with `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`.
+AES first where the machine has the instructions, ChaCha first otherwise;
+`ktls_keys_set_ciphers` overrides.
 
-| | `TLS_AES_128_GCM_SHA256` | `TLS_CHACHA20_POLY1305_SHA256` |
-|---|---|---|
-| kernel kTLS | yes | yes |
-| NIC offload (`ethtool tls-hw-tx-offload`) | **yes** | no |
-| without AES instructions | slower, and timing-sensitive | constant-time by construction |
-| records under one key | 2^24.5 (RFC 8446 5.5) | none anyone reaches |
-
-AES first where the machine has the instructions, ChaCha first
-otherwise; `ktls_keys_set_ciphers` overrides. `TLS_AES_256_GCM_SHA384`
-is not offered: 14 rounds instead of 10 for security nobody can reach,
-and it would have dragged SHA-384 into the key schedule.
-
-A KeyUpdate costs the 32 bytes of secret the exchange still holds and
-nothing else — `ktls_next_key` turns it one notch with RFC 8446 7.2's
-`"traffic upd"` label. That is what makes AES-GCM's limit answerable
-rather than fatal.
+Peer verification is off: `ktls_keys_client` carries no trust store.
 
 ## Linux and FreeBSD
 
-Two kernels carry TLS and they agree on nothing but the idea.
-
 | | Linux | FreeBSD |
 |---|---|---|
-| attach | `setsockopt(TCP_ULP, "tls")` | nothing - the keys go straight on |
+| attach | `setsockopt(TCP_ULP, "tls")` | nothing |
 | is it there | `/proc/net/tls_stat` | `kern.ipc.tls.enable` |
-| turn it on | `modprobe tls` (or `ktls_load_module`) | the same sysctl, written |
-| the struct | `tls12_crypto_info_*`, one per cipher, material inside | one `struct tls_enable`, pointing at it |
-| the iv | split: AES-GCM 4 salt + 8 iv, ChaCha all 12 | never split - all 12, with `iv_len` |
-| receiving | always | only where `TCP_RXTLS_ENABLE` exists |
+| turn it on | `modprobe tls`, or `ktls_load_module` | the same sysctl |
+| receiving | always | where `TCP_RXTLS_ENABLE` exists |
 
-`ktls_attach_ulp` is a no-op on FreeBSD so no caller needs an `#ifdef`,
-and `ktls_sol_tls` / `ktls_optname` answer that kernel's level and
-names. Where receiving cannot be offloaded, `ktls_offload` refuses by
-name rather than handing over half a socket.
+`ktls_attach_ulp` is a no-op on FreeBSD. The FreeBSD half has not been
+compiled on FreeBSD.
 
-The FreeBSD half is written against `sys/sys/ktls.h` and OpenSSL's own
-FreeBSD path, and has not been compiled on FreeBSD. It is marked here
-so nobody mistakes it for tested.
+## OpenSSL
 
-## Reading a kernel-owned socket
-
-**Never a plain `recv`.** A record that is not application data — an
-alert, a KeyUpdate — surfaces as `EIO` there. Read with `recvmsg` and
-take the type out of its `TLS_GET_RECORD_TYPE` control message: 23 is
-data, 21 an alert, 22 a KeyUpdate to answer. Writing one is the mirror,
-`TLS_SET_RECORD_TYPE` on a `sendmsg`, which is also how `close_notify`
-goes out without this library.
-
-## Why OpenSSL, and why >= 3.0
-
-Measured, not assumed:
-
-- **s2n-tls** cannot hand ChaCha to the kernel at all.
-  `tls/s2n_ktls.c` requires `cipher->set_ktls_info`, and
-  `crypto/s2n_aead_cipher_aes_gcm.c` is the only file that defines one
-   — in the current pin and in upstream `main`.
-- **mbedTLS** has no kTLS code: no hit for `ktls`, `kernel_tls` or
-  `TCP_ULP` anywhere in its tree. The key export callback is there, but
-  `mbedtls_ssl_tls13_make_traffic_keys` is in a private header.
-- **A distribution's OpenSSL usually serves.** Ubuntu 24.04 (3.0.13)
-  and openSUSE (3.5.3) both build theirs with kTLS. What is NOT
-  dependable is the NAME: openSUSE lets LibreSSL own
-  `/usr/lib64/pkgconfig/libssl.pc`, so a machine whose `openssl
-  version` says OpenSSL 3.5.3 hands every build LibreSSL 4.3.2 headers,
-  and LibreSSL has neither `EVP_KDF` TLS13-KDF nor kTLS. `src/ktls.c`
-  refuses it by `#error`; `tools/openssl.rb` refuses it earlier and by
-  name.
-
-## The OpenSSL this gem builds against
-
-Your machine's. Nothing is vendored and nothing is a submodule.
-
-`tools/openssl.rb` asks pkg-config for `libssl`, `openssl`, `openssl3`,
-`libopenssl` and `libopenssl-3`, in that order, and takes the first
-whose **header** answers three questions correctly: no
-`LIBRESSL_VERSION_TEXT`, `OPENSSL_VERSION_MAJOR` at least 3, and a
-compile that does not see `OPENSSL_NO_KTLS`. The last one is a compile
-rather than a grep, because the macro reaches the source through
-whichever configuration header `ssl.h` pulls in, and that file differs
-by distribution.
-
-Two knobs, for a machine that needs them:
-
-```sh
-OPENSSL_PKG_CONFIG=openssl3 rake       # name the module yourself
-PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH rake
-```
-
-`rake openssl` prints which one was chosen and what it contributes.
-
-### Per distribution
+The machine's, OpenSSL 3.0 or later, built with kTLS. Nothing is
+vendored. `rake openssl` prints which one was chosen.
 
 | | |
 | --- | --- |
@@ -171,70 +82,24 @@ PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH rake
 | Arch | `pacman -S openssl` |
 | Debian, Ubuntu | `apt install libssl-dev` |
 
-**openSUSE needs one word of warning.** `libopenssl-3-devel` and
-`libressl-devel` both provide `ssl-devel` and cannot both be installed.
-Installing the OpenSSL one removes `libressl-devel`, and zypper then
-satisfies the other `-devel` packages that wanted an SSL — `libcurl-devel`,
-`postgresql-devel`, `grpc-devel` — with it. Removing `libressl-devel`
-on its own does the opposite: it takes those packages with it. So
-install, do not remove.
+On openSUSE, install `libopenssl-3-devel`; do not remove
+`libressl-devel`, which takes `libcurl-devel` and `postgresql-devel`
+with it. LibreSSL is refused by name: it has no TLS13-KDF and no kTLS.
 
-**A machine whose OpenSSL has no kTLS** builds one under a prefix of
-its own, and nothing of the distribution is touched:
+Two knobs:
 
 ```sh
-git clone --depth 1 --branch openssl-3.5.3 https://github.com/openssl/openssl /tmp/ossl
-cd /tmp/ossl
-./Configure --prefix=$HOME/.local/openssl shared enable-ktls no-tests no-docs
-make -j$(nproc) && make install_sw
-export PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH
+OPENSSL_PKG_CONFIG=openssl3 rake
+PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH rake
 ```
 
-## Four processes
-
-The process that strangers send requests to holds no keys.
-
-```
-supervisor
-├── logd        no crypto
-├── acme        mruby-url over the system libcurl, whatever TLS the distro has
-├── ktls        this library, OpenSSL >= 3, holds the keys and the secrets
-└── webserver   no crypto at all
-```
-
-`ktls` accepts, runs the exchange, installs ULP + `TLS_TX` + `TLS_RX`
-on its own direct descriptor, and pushes that descriptor into the
-webserver's ring with `IORING_OP_MSG_RING` / `MSG_SEND_FD` — table to
-table, no fd number in either process, ALPN riding along as the
-message's data. It keeps its own slot, so when the webserver sees a
-record of type 22 it sends one `MSG_DATA` back saying which connection
-needs its keys turned.
-
-`acme` is a process of its own because its libcurl brings the
-distribution's TLS, and two libcryptos in one address space is a bug
-waiting for a link order.
-
-## Tests
-
-`rake test` proves the Ruby surface. `examples/ktls_c_api.c` and
-`examples/ktls_cpp_api.cpp` prove the other two, running a whole exchange
-between two objects in one thread with no socket anywhere — the check
-that carries the rest is that the server's SEND blob **is** the
-client's RECEIVE blob, byte for byte, before and after a key update,
-under both suites.
-
-`examples/ktls_handover.c` is the half those cannot reach: it needs a
-kernel with `CONFIG_TLS`, opens a real loopback pair, hands both
-sockets over, frees everything, and then writes plaintext through.
+## Tasks
 
 ```sh
-cc -std=c11 -D_GNU_SOURCE -O2 -o ktls_handover \
-   examples/ktls_handover.c src/ktls.c -Iinclude $(pkg-config --cflags --libs openssl)
-./ktls_handover
+rake test        # the Ruby surface
+rake exchange    # a whole exchange from C and C++, no socket
+rake handover    # a real loopback pair; exits 77 without a tls ULP
 ```
-
-It exits 77 and says so where there is no tls ULP, rather than claiming
-anything.
 
 ## License
 
