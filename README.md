@@ -82,10 +82,6 @@ vendored. `rake openssl` prints which one was chosen.
 | Arch | `pacman -S openssl` |
 | Debian, Ubuntu | `apt install libssl-dev` |
 
-On openSUSE, install `libopenssl-3-devel`; do not remove
-`libressl-devel`, which takes `libcurl-devel` and `postgresql-devel`
-with it. LibreSSL is refused by name: it has no TLS13-KDF and no kTLS.
-
 Two knobs:
 
 ```sh

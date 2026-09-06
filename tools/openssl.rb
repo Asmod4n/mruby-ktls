@@ -95,29 +95,23 @@ module KtlsOpenSSL
     <<~MSG
       [mruby-ktls] no OpenSSL >= 3.0 with kTLS was found.
 
-      This gem hands the record layer to the kernel, so it needs OpenSSL's
-      key schedule (EVP_KDF TLS13-KDF, OpenSSL 3.0) and its kTLS entry
-      points. LibreSSL has neither.
+      Asked, through pkg-config: #{CANDIDATES.join(', ')}.
 
-      What was asked: pkg-config for #{CANDIDATES.join(', ')}.
-      Name one yourself with OPENSSL_PKG_CONFIG=, or point
-      PKG_CONFIG_PATH at a prefix of your own.
+      Install one:
 
-      openSUSE   zypper install libopenssl-3-devel
-                 LibreSSL owns /usr/lib64/pkgconfig/libssl.pc there, so a
-                 machine with libressl-devel hands every build LibreSSL
-                 headers while `openssl version` says OpenSSL. The two
-                 -devel packages cannot both be installed; the other
-                 -devel packages take libopenssl-3-devel just as happily.
-      Fedora     dnf install openssl-devel
-      Arch       pacman -S openssl
-      Debian     apt install libssl-dev
-      Ubuntu     apt install libssl-dev
-                 24.04's OpenSSL 3.0.13 carries no kTLS entry points. A
-                 build of your own is the way out:
-                   ./Configure --prefix=$HOME/.local/openssl shared enable-ktls
-                   make -j$(nproc) && make install_sw
-                   export PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH
+        openSUSE        zypper install libopenssl-3-devel
+        Fedora          dnf install openssl-devel
+        Arch            pacman -S openssl
+        Debian, Ubuntu  apt install libssl-dev
+
+      Or name the module:      OPENSSL_PKG_CONFIG=openssl3
+      Or name a prefix:        PKG_CONFIG_PATH=<prefix>/lib64/pkgconfig
+
+      Or build one:
+
+        ./Configure --prefix=$HOME/.local/openssl shared enable-ktls
+        make -j$(nproc) && make install_sw
+        export PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH
     MSG
   end
 end
