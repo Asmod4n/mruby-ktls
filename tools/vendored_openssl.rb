@@ -25,8 +25,10 @@ module VendoredOpenSSL
   # Returns the build directory, which holds libssl.so, libcrypto.so and
   # the generated include/openssl. Builds it if it is not there yet.
   def build(src, dest)
+    fetch_source(src) unless File.file?("#{src}/Configure")
     unless File.file?("#{src}/Configure")
-      raise "[mruby-ktls] #{src} is empty - run: git submodule update --init --depth 1"
+      raise "[mruby-ktls] #{src} has no OpenSSL - run: " \
+            "git submodule update --init --depth 1 --checkout deps/openssl"
     end
     return dest if File.file?("#{dest}/libssl.so")
 
@@ -37,6 +39,25 @@ module VendoredOpenSSL
       sh_quiet("make -j#{jobs} build_libs", log)
     end
     dest
+  end
+
+  # The OpenSSL source, taken by name. .gitmodules marks it `update =
+  # none` so that a recursive clone does not drag in the eleven
+  # repositories OpenSSL lists as ITS submodules - test material for
+  # other projects, 581 MB of it. --checkout overrides that mark for
+  # this one, --depth 1 keeps the history off, and `git submodule
+  # update` does not recurse unless it is told to.
+  #
+  # Silent when it cannot run: a source tree that was unpacked from a
+  # tarball has no .git, and the raise above says what to do.
+  def fetch_source(src)
+    root = File.expand_path('..', File.dirname(src))
+    return unless File.exist?("#{root}/.git")
+
+    Dir.chdir(root) do
+      system('git', 'submodule', 'update', '--init', '--depth', '1', '--checkout',
+             src.sub("#{root}/", ''), out: File::NULL)
+    end
   end
 
   # The two -I paths a caller needs: generated headers first, then the

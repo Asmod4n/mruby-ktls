@@ -1,3 +1,19 @@
+# update = none says what this repository needs and what it does not.
+#
+# A clone that recurses - `git clone --recursive`, which is what mruby's
+# build system runs for every gem - would take OpenSSL AND the eleven
+# repositories OpenSSL lists as its own submodules: cloudflare-quiche,
+# krb5, wycheproof, pyca-cryptography, tlsfuzzer and the rest. That is
+# 581 MB and about three minutes, and none of it builds a libcrypto.
+#
+# So the recursion stops here, and the build takes the one it needs by
+# name: tools/vendored_openssl.rb runs
+#
+#   git submodule update --init --depth 1 --checkout deps/openssl
+#
+# --checkout is what overrides this line for that one submodule, and
+# `git submodule update` does not recurse unless it is told to.
 [submodule "deps/openssl"]
 	path = deps/openssl
 	url = https://github.com/openssl/openssl
+	update = none
