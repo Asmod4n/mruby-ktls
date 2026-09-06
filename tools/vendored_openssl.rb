@@ -25,7 +25,11 @@ module VendoredOpenSSL
   # Returns the build directory, which holds libssl.so, libcrypto.so and
   # the generated include/openssl. Builds it if it is not there yet.
   def build(src, dest)
-    fetch_source(src) unless File.file?("#{src}/Configure")
+    # EVERY time, not only when the tree is empty. `update = none` in
+    # .gitmodules means a plain `git submodule update` never moves this
+    # one, so a pin that moved would leave an old OpenSSL on disk and
+    # nothing would say so. At the pinned commit the call does nothing.
+    fetch_source(src)
     unless File.file?("#{src}/Configure")
       raise "[mruby-ktls] #{src} has no OpenSSL - run: " \
             "git submodule update --init --depth 1 --checkout deps/openssl"
