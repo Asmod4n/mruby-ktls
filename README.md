@@ -131,15 +131,64 @@ Measured, not assumed:
 - **mbedTLS** has no kTLS code: no hit for `ktls`, `kernel_tls` or
   `TCP_ULP` anywhere in its tree. The key export callback is there, but
   `mbedtls_ssl_tls13_make_traffic_keys` is in a private header.
-- **The system OpenSSL is not dependable.** openSUSE ships LibreSSL,
-  which has neither `EVP_KDF` TLS13-KDF nor kTLS. Ubuntu ships OpenSSL
-  3.0.13 whose `libssl.so.3` exports **no** ktls symbol — kTLS is off
-  by default before 3.2, and `BIO_get_ktls_send` is a macro that
-  compiles to `(0)`, so a build without it fails silently. `src/ktls.c`
-  refuses both, by `#error` and by name.
+- **A distribution's OpenSSL usually serves.** Ubuntu 24.04 (3.0.13)
+  and openSUSE (3.5.3) both build theirs with kTLS. What is NOT
+  dependable is the NAME: openSUSE lets LibreSSL own
+  `/usr/lib64/pkgconfig/libssl.pc`, so a machine whose `openssl
+  version` says OpenSSL 3.5.3 hands every build LibreSSL 4.3.2 headers,
+  and LibreSSL has neither `EVP_KDF` TLS13-KDF nor kTLS. `src/ktls.c`
+  refuses it by `#error`; `tools/openssl.rb` refuses it earlier and by
+  name.
 
-So OpenSSL is vendored (`deps/openssl`) and built here, **shared** on
-purpose — see below.
+## The OpenSSL this gem builds against
+
+Your machine's. Nothing is vendored and nothing is a submodule.
+
+`tools/openssl.rb` asks pkg-config for `libssl`, `openssl`, `openssl3`,
+`libopenssl` and `libopenssl-3`, in that order, and takes the first
+whose **header** answers three questions correctly: no
+`LIBRESSL_VERSION_TEXT`, `OPENSSL_VERSION_MAJOR` at least 3, and a
+compile that does not see `OPENSSL_NO_KTLS`. The last one is a compile
+rather than a grep, because the macro reaches the source through
+whichever configuration header `ssl.h` pulls in, and that file differs
+by distribution.
+
+Two knobs, for a machine that needs them:
+
+```sh
+OPENSSL_PKG_CONFIG=openssl3 rake       # name the module yourself
+PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH rake
+```
+
+`rake openssl` prints which one was chosen and what it contributes.
+
+### Per distribution
+
+| | |
+| --- | --- |
+| openSUSE | `zypper install libopenssl-3-devel` |
+| Fedora | `dnf install openssl-devel` |
+| Arch | `pacman -S openssl` |
+| Debian, Ubuntu | `apt install libssl-dev` |
+
+**openSUSE needs one word of warning.** `libopenssl-3-devel` and
+`libressl-devel` both provide `ssl-devel` and cannot both be installed.
+Installing the OpenSSL one removes `libressl-devel`, and zypper then
+satisfies the other `-devel` packages that wanted an SSL — `libcurl-devel`,
+`postgresql-devel`, `grpc-devel` — with it. Removing `libressl-devel`
+on its own does the opposite: it takes those packages with it. So
+install, do not remove.
+
+**A machine whose OpenSSL has no kTLS** builds one under a prefix of
+its own, and nothing of the distribution is touched:
+
+```sh
+git clone --depth 1 --branch openssl-3.5.3 https://github.com/openssl/openssl /tmp/ossl
+cd /tmp/ossl
+./Configure --prefix=$HOME/.local/openssl shared enable-ktls no-tests no-docs
+make -j$(nproc) && make install_sw
+export PKG_CONFIG_PATH=$HOME/.local/openssl/lib64/pkgconfig:$PKG_CONFIG_PATH
+```
 
 ## Four processes
 

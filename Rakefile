@@ -35,34 +35,37 @@ end
 
 # --- the standalone programs -----------------------------------------
 #
-# They must NOT be built against the machine's TLS library. That is the
-# whole point of vendoring one: openSUSE ships LibreSSL, which has
-# neither EVP_KDF TLS13-KDF nor kTLS, and a distribution's OpenSSL may
-# have kTLS compiled out. `pkg-config --libs openssl` finds exactly the
-# wrong thing, and src/ktls.c says so by #error rather than building
-# something that fails at runtime.
+# They build against the OpenSSL the machine offers, chosen by
+# tools/openssl.rb rather than by a bare `pkg-config libssl`: openSUSE
+# lets LibreSSL own that name, and LibreSSL has neither EVP_KDF
+# TLS13-KDF nor kTLS. The probe reads the header behind every candidate
+# and refuses by name, which is what src/ktls.c would otherwise say as
+# a wall of #error text.
 
-require_relative 'tools/vendored_openssl'
+require_relative 'tools/openssl'
 
-OSSL_SRC   = File.expand_path('deps/openssl', __dir__)
-OSSL_BUILD = File.expand_path('build/openssl', __dir__)
-EXAMPLES   = File.expand_path('build/examples', __dir__)
+EXAMPLES = File.expand_path('build/examples', __dir__)
 
-desc 'build the vendored OpenSSL (shared, with kTLS) - once, then cached'
+def openssl!
+  @openssl ||= KtlsOpenSSL.find or abort(KtlsOpenSSL.refusal_message)
+end
+
+desc 'which OpenSSL this machine offers'
 task :openssl do
-  VendoredOpenSSL.build(OSSL_SRC, OSSL_BUILD)
-  puts "openssl: #{OSSL_BUILD}/libssl.so"
+  o = openssl!
+  puts "openssl: #{o[:version]} through pkg-config #{o[:module]}"
+  puts "  cflags: #{o[:cflags].empty? ? '(none)' : o[:cflags]}"
+  puts "  libs:   #{o[:libs]}"
 end
 
 def compile_example(cc, src, out, std)
-  inc = VendoredOpenSSL.include_paths(OSSL_SRC, OSSL_BUILD).map { |i| "-I#{i}" }.join(' ')
+  o = openssl!
   FileUtils.mkdir_p(EXAMPLES)
   sh "#{cc} #{std} -D_GNU_SOURCE -O2 -Wall -Wextra -o #{EXAMPLES}/#{out} " \
-     "#{src} src/ktls.c -Iinclude #{inc} " \
-     "-L#{OSSL_BUILD} -lssl -lcrypto -Wl,-rpath,#{OSSL_BUILD} -lpthread -ldl"
+     "#{src} src/ktls.c -Iinclude #{o[:cflags]} #{o[:libs]} -lcrypto -lpthread -ldl"
 end
 
-desc 'build examples/ against the vendored OpenSSL'
+desc "build examples/ against the machine's OpenSSL"
 task examples: :openssl do
   compile_example('cc',  'examples/ktls_c_api.c',     'ktls_c_api',     '-std=c11')
   compile_example('c++', 'examples/ktls_cpp_api.cpp', 'ktls_cpp_api',   '-std=c++20')
