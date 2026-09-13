@@ -3,7 +3,9 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #if defined(__linux__) || defined(__FreeBSD__)
 
@@ -300,10 +302,26 @@ ktls_record ktls_record_type(const void *cmsg_data, size_t len)
 
 /* ---- the keys this server answers with --------------------------- */
 
+/* RFC 6066 3: one more certificate, and the name that picks it. */
+struct ktls_named_ctx {
+  char host[256];
+  SSL_CTX *ctx;
+};
+
 struct ktls_keys {
   SSL_CTX *ctx;
   unsigned char alpn[256];
   size_t alpn_len;
+  /* RFC 6066 3: the certificates a server_name picks, and how many of
+   * them. ctx above stays the default: it answers a client that names
+   * nothing, and a name none of these match. */
+  struct ktls_named_ctx *named;
+  size_t named_count;
+  /* The suites a caller asked for, kept so that a certificate added
+   * afterwards is set up the same way. Empty means nobody asked, and
+   * then every context keeps the order ktls_ctx_new chose for this
+   * machine. */
+  char suites[256];
 };
 
 /* AES-GCM in software is table-driven and timing-sensitive; with the
@@ -402,12 +420,135 @@ static int ktls_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *ou
   return SSL_TLSEXT_ERR_NOACK;
 }
 
+/* The suites and the ALPN list every context of these keys carries. A
+ * context a server_name picks has to answer the same way the default
+ * one does: SSL_set_SSL_CTX takes both from the context in force, so a
+ * named context that never heard them would offer other suites and no
+ * ALPN at all. */
+static int ktls_ctx_follow(ktls_keys *keys, SSL_CTX *ctx)
+{
+  if (keys->suites[0] != '\0' && SSL_CTX_set_ciphersuites(ctx, keys->suites) != 1) {
+    ktls_fail("set_ciphersuites");
+    return -1;
+  }
+  if (keys->alpn_len != 0) {
+    SSL_CTX_set_alpn_select_cb(ctx, ktls_alpn_pick, keys);
+    if (SSL_CTX_set_alpn_protos(ctx, keys->alpn, (unsigned) keys->alpn_len) != 0) {
+      ktls_fail("SSL_CTX_set_alpn_protos");
+      return -1;
+    }
+  }
+  return 0;
+}
+
 int ktls_keys_set_ciphers(ktls_keys *keys, const char *suites)
 {
+  const size_t len = suites == NULL ? 0 : strlen(suites);
+  if (len == 0 || len >= sizeof(keys->suites)) {
+    ktls_say("ktls_keys_set_ciphers: the suite list is empty or too long");
+    return -1;
+  }
   if (SSL_CTX_set_ciphersuites(keys->ctx, suites) != 1) {
     ktls_fail("set_ciphersuites");
     return -1;
   }
+  memcpy(keys->suites, suites, len + 1);
+  for (size_t i = 0; i < keys->named_count; i++) {
+    if (SSL_CTX_set_ciphersuites(keys->named[i].ctx, suites) != 1) {
+      ktls_fail("set_ciphersuites");
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* RFC 6066 3, RFC 6125 6.4.3: the name is compared without regard to
+ * letter case, and one leading "*." matches exactly one label. So
+ * "*.example.com" answers for "a.example.com", and not for
+ * "a.b.example.com" and not for "example.com" itself. */
+static bool ktls_host_matches(const char *pattern, const char *name)
+{
+  if (pattern[0] == '*' && pattern[1] == '.') {
+    const char *dot = strchr(name, '.');
+    if (dot == NULL) return false;
+    return strcasecmp(dot + 1, pattern + 2) == 0;
+  }
+  return strcasecmp(pattern, name) == 0;
+}
+
+/* RFC 6066 3: the certificate the ClientHello's server_name asks for.
+ *
+ * A client that names nothing keeps the default pair, and so does a
+ * name none of the pairs match. That is nginx's default_server answer,
+ * and it means a client that reached this server by address is served
+ * rather than told which names exist here.
+ *
+ * The callback sits on the default context, because that is the context
+ * in force while the ClientHello is being read. */
+static int ktls_name_pick(SSL *ssl, int *alert, void *arg)
+{
+  ktls_keys *keys = (ktls_keys *) arg;
+  (void) alert;
+  const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+  if (name == NULL) return SSL_TLSEXT_ERR_OK;
+  for (size_t i = 0; i < keys->named_count; i++) {
+    if (!ktls_host_matches(keys->named[i].host, name)) continue;
+    if (SSL_set_SSL_CTX(ssl, keys->named[i].ctx) == NULL) {
+      ktls_fail("SSL_set_SSL_CTX");
+      return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    break;
+  }
+  return SSL_TLSEXT_ERR_OK;
+}
+
+int ktls_keys_add_certificate(ktls_keys *keys, const char *host,
+                              const char *cert_pem, size_t cert_len,
+                              const char *key_pem, size_t key_len)
+{
+  const size_t host_len = host == NULL ? 0 : strlen(host);
+  if (host_len == 0 || host_len >= sizeof(keys->named[0].host)) {
+    ktls_say("ktls_keys_add_certificate: the host name is empty or too long");
+    return -1;
+  }
+  for (size_t i = 0; i < keys->named_count; i++) {
+    if (strcasecmp(keys->named[i].host, host) == 0) {
+      ktls_say("ktls_keys_add_certificate: that host name was already named");
+      return -1;
+    }
+  }
+  SSL_CTX *ctx = ktls_ctx_new();
+  if (ctx == NULL) return -1;
+  if (ktls_pem_into(ctx, cert_pem, cert_len, 0) != 0 ||
+      ktls_pem_into(ctx, key_pem, key_len, 1) != 0) {
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  /* The same startup check ktls_keys_server makes, and for the same
+   * reason: a key that does not belong to the certificate is refused by
+   * every handshake and by neither call above. */
+  if (SSL_CTX_check_private_key(ctx) != 1) {
+    ktls_fail("the private key does not match the certificate");
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  if (ktls_ctx_follow(keys, ctx) != 0) {
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  struct ktls_named_ctx *grown = (struct ktls_named_ctx *) realloc(
+      keys->named, (keys->named_count + 1) * sizeof(*grown));
+  if (grown == NULL) {
+    ktls_say("out of memory");
+    SSL_CTX_free(ctx);
+    return -1;
+  }
+  keys->named = grown;
+  memcpy(grown[keys->named_count].host, host, host_len + 1);
+  grown[keys->named_count].ctx = ctx;
+  keys->named_count++;
+  SSL_CTX_set_tlsext_servername_callback(keys->ctx, ktls_name_pick);
+  SSL_CTX_set_tlsext_servername_arg(keys->ctx, keys);
   return 0;
 }
 
@@ -433,6 +574,16 @@ int ktls_keys_set_alpn(ktls_keys *keys, const char *const *protocols, size_t cou
   if (SSL_CTX_set_alpn_protos(keys->ctx, keys->alpn, (unsigned) n) != 0) {
     ktls_fail("SSL_CTX_set_alpn_protos");
     return -1;
+  }
+  /* A certificate added before this call gets the list now; one added
+   * afterwards gets it in ktls_keys_add_certificate. Either order
+   * leaves every context carrying the same answer. */
+  for (size_t i = 0; i < keys->named_count; i++) {
+    SSL_CTX_set_alpn_select_cb(keys->named[i].ctx, ktls_alpn_pick, keys);
+    if (SSL_CTX_set_alpn_protos(keys->named[i].ctx, keys->alpn, (unsigned) n) != 0) {
+      ktls_fail("SSL_CTX_set_alpn_protos");
+      return -1;
+    }
   }
   return 0;
 }
@@ -475,6 +626,10 @@ ktls_keys *ktls_keys_client(void)
 void ktls_keys_free(ktls_keys *keys)
 {
   if (keys == NULL) return;
+  for (size_t i = 0; i < keys->named_count; i++) {
+    SSL_CTX_free(keys->named[i].ctx);
+  }
+  free(keys->named);
   SSL_CTX_free(keys->ctx);
   free(keys);
 }
@@ -1019,6 +1174,9 @@ int ktls_optname(ktls_direction dir) { (void) dir; return -1; }
 ktls_keys *ktls_keys_server(const char *c, size_t cl, const char *k, size_t kl)
 { (void) c; (void) cl; (void) k; (void) kl; return NULL; }
 ktls_keys *ktls_keys_client(void) { return NULL; }
+int ktls_keys_add_certificate(ktls_keys *k, const char *h, const char *c, size_t cl,
+                              const char *key, size_t kl)
+{ (void) k; (void) h; (void) c; (void) cl; (void) key; (void) kl; return -1; }
 int ktls_keys_set_alpn(ktls_keys *k, const char *const *p, size_t n)
 { (void) k; (void) p; (void) n; return -1; }
 void ktls_keys_free(ktls_keys *k) { (void) k; }

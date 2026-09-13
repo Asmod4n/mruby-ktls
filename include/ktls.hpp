@@ -50,6 +50,11 @@ class Keys {
     return ktls_keys_set_alpn(k_, protocols, count);
   }
   int set_ciphers(const char* suites) { return ktls_keys_set_ciphers(k_, suites); }
+  /* RFC 6066 3: one more pair, picked by the ClientHello's server_name. */
+  int add_certificate(const char* host, const char* cert_pem, size_t cert_len,
+                      const char* key_pem, size_t key_len) {
+    return ktls_keys_add_certificate(k_, host, cert_pem, cert_len, key_pem, key_len);
+  }
 
  private:
   explicit Keys(ktls_keys* k) : k_(k) {}
