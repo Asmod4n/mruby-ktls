@@ -356,6 +356,11 @@ bool ktls_aes_is_fast(void)
  * it: ktls_record_limit says how many, and every sendmsg is at least
  * one record and at most ceil(len / 16384). A caller that does not
  * count must ask for ChaCha, which has no limit anyone reaches. */
+/* Defined below, beside the secrets it catches. Declared here because
+ * every context this library makes needs it, and ktls_ctx_new is where
+ * every context is made. */
+static void ktls_keylog(const SSL *ssl, const char *line);
+
 static SSL_CTX *ktls_ctx_new(void)
 {
   SSL_CTX *ctx = SSL_CTX_new(TLS_method());
@@ -376,6 +381,14 @@ static SSL_CTX *ktls_ctx_new(void)
     SSL_CTX_free(ctx);
     return NULL;
   }
+  /* The traffic secrets arrive through this callback and nowhere else,
+   * so it belongs to the context rather than to one exchange. A
+   * certificate a server_name picks brings its own context, and
+   * SSL_set_SSL_CTX makes that context the one OpenSSL asks: a context
+   * without this callback finishes its handshake and hands over no
+   * secrets, and the step that needs them fails after the peer has
+   * already seen a finished handshake. */
+  SSL_CTX_set_keylog_callback(ctx, ktls_keylog);
   return ctx;
 }
 
@@ -809,7 +822,9 @@ ktls_exchange *ktls_exchange_open(ktls_keys *keys, ktls_role role)
    * keeps owning it. */
   SSL_set_bio(x->ssl, x->in, x->out);
   SSL_set_ex_data(x->ssl, ktls_ex_index(), x);
-  SSL_CTX_set_keylog_callback(keys->ctx, ktls_keylog);
+  /* The keylog callback is the context's, set in ktls_ctx_new. Setting
+   * it here reached the default context only, and a certificate picked
+   * by server_name answers from another one. */
   if (role == KTLS_SERVER) SSL_set_accept_state(x->ssl);
   else SSL_set_connect_state(x->ssl);
   return x;
