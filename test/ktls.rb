@@ -113,3 +113,70 @@ assert('the handover refuses by name where the tls module is not loaded') do
   s, = ktls_pair
   assert_raise(KTLS::Error) { s.offload(0) }
 end
+
+# RFC 6066 3: one listener, several certificates. A second 100-year
+# self-signed P-256, for other.example, generated once for this test and
+# worth nothing.
+OTHER_CERT = "-----BEGIN CERTIFICATE-----\n" \
+  "MIIBiDCCAS2gAwIBAgIUMhILN0XXkz3STvXMEHmkAVLjdXwwCgYIKoZIzj0EAwIw\n" \
+  "GDEWMBQGA1UEAwwNb3RoZXIuZXhhbXBsZTAgFw0yNjA5MTMwNjAzNThaGA8yMTI2\n" \
+  "MDgyMDA2MDM1OFowGDEWMBQGA1UEAwwNb3RoZXIuZXhhbXBsZTBZMBMGByqGSM49\n" \
+  "AgEGCCqGSM49AwEHA0IABGDGWjXpAaZeNBnPavrOfIrupWJF6thhQVCSP1jeAJhe\n" \
+  "k2RgFIJihzRan9K7ln/wzAUqtyHBTbVoieF0Z12qLvijUzBRMB0GA1UdDgQWBBR3\n" \
+  "iOuj6y2tOhYi1wmtIOYROLxfeDAfBgNVHSMEGDAWgBR3iOuj6y2tOhYi1wmtIOYR\n" \
+  "OLxfeDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQDnNG5k89pu\n" \
+  "RAzmBC+7CsSVYraCymnTjAFffrZ/5R6UGQIhAIpazcBA8qB2r727rIZX4c7+3A17\n" \
+  "W+r/FNqEhmk88r/y\n" \
+  "-----END CERTIFICATE-----\n"
+
+OTHER_KEY = "-----BEGIN PRIVATE KEY-----\n" \
+  "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg41ePfxAmju+RluFu\n" \
+  "C9aHj7fqBQR1WfDKsDCU9tSyfhGhRANCAARgxlo16QGmXjQZz2r6znyK7qViRerY\n" \
+  "YUFQkj9Y3gCYXpNkYBSCYoc0Wp/Su5Z/8MwFKrchwU21aInhdGddqi74\n" \
+  "-----END PRIVATE KEY-----\n"
+
+assert('a second certificate is accepted, and a pair that does not belong together is not') do
+  keys = KTLS::Keys.server(TEST_CERT, TEST_KEY)
+  assert_equal 'other.example', keys.add_certificate('other.example', OTHER_CERT, OTHER_KEY)
+  # A wildcard is a name like any other here; what it matches is decided
+  # in the handshake.
+  assert_equal '*.other.example',
+               keys.add_certificate('*.other.example', OTHER_CERT, OTHER_KEY)
+  # The key of the other pair. Every handshake would refuse it, so the
+  # call refuses it here, where the operator can still read why.
+  assert_raise(KTLS::Error) { keys.add_certificate('third.example', OTHER_CERT, TEST_KEY) }
+  # One name, one certificate.
+  assert_raise(KTLS::Error) { keys.add_certificate('other.example', OTHER_CERT, OTHER_KEY) }
+  # And the name is one name whatever letter case it is written in.
+  assert_raise(KTLS::Error) { keys.add_certificate('OTHER.example', OTHER_CERT, OTHER_KEY) }
+  # An empty name names nothing.
+  assert_raise(KTLS::Error) { keys.add_certificate('', OTHER_CERT, OTHER_KEY) }
+end
+
+assert('a client that names no host gets the default pair, and the handshake still runs') do
+  server_keys = KTLS::Keys.server(TEST_CERT, TEST_KEY)
+  server_keys.add_certificate('other.example', OTHER_CERT, OTHER_KEY)
+  # The ALPN list is set after the second certificate, which is the order
+  # that used to leave that certificate with no ALPN at all.
+  server_keys.alpn = ['h2', 'http/1.1']
+  client_keys = KTLS::Keys.client
+  client_keys.alpn = ['h2', 'http/1.1']
+  server = KTLS::Exchange.new(server_keys, :server)
+  client = KTLS::Exchange.new(client_keys, :client)
+
+  server_step = client_step = :reading
+  64.times do
+    break if server_step == :done && client_step == :done
+    client_step = client.step
+    server.feed(client.take)
+    server_step = server.step
+    client.feed(server.take)
+  end
+  server.backlog
+  client.backlog
+  assert_equal :done, server_step
+  assert_equal :done, client_step
+  # The ALPN answer proves the list reached the context in force.
+  assert_equal 'h2', client.alpn
+  assert_equal 'h2', server.alpn
+end

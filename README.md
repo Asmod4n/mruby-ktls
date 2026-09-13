@@ -225,6 +225,42 @@ In C++ it is `x.record_limit()`, `x.next_key(KTLS_TX)` and
 - Keep the exchange while the connection lives if you will rekey;
   `ktls_exchange_release` drops the large part of it.
 
+## One listener, several certificates
+
+RFC 6066 3. `ktls_keys_server` makes one pair, and that pair is the
+default. `ktls_keys_add_certificate` adds a pair with a name, and the
+ClientHello's `server_name` picks between them.
+
+    ktls_keys *keys = ktls_keys_server(cert, cert_len, key, key_len);
+    ktls_keys_add_certificate(keys, "shop.example", shop_cert, shop_cert_len,
+                              shop_key, shop_key_len);
+    ktls_keys_add_certificate(keys, "*.api.example", api_cert, api_cert_len,
+                              api_key, api_key_len);
+
+In Ruby:
+
+    keys = KTLS::Keys.server(cert, key)
+    keys.add_certificate('shop.example', shop_cert, shop_key)
+
+Two rules, and both are deliberate.
+
+**A name nobody added keeps the default pair**, and so does a client that
+names nothing. That is what nginx's `default_server` does. The other
+answer, refusing the handshake, tells a stranger which names this server
+holds and breaks every client that arrived by address.
+
+**The name is compared without regard to letter case, and one leading
+`*.` matches exactly one label.** So `*.api.example` answers for
+`v1.api.example`, and not for `v1.beta.api.example` and not for
+`api.example` itself.
+
+The suites and the ALPN list reach every pair, whichever order the calls
+come in: `SSL_set_SSL_CTX` takes both from the context in force, so a
+named pair that never heard them would offer other suites and no ALPN.
+A pair whose key does not belong to its certificate is refused by the
+call, not by the first handshake that needs it. The same name twice is
+refused.
+
 ## What it speaks
 
 TLS 1.3 with `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`.

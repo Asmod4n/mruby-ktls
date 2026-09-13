@@ -61,6 +61,26 @@ typedef struct ktls_keys ktls_keys;
 ktls_keys *ktls_keys_server(const char *cert_pem, size_t cert_len,
                             const char *key_pem, size_t key_len);
 
+/* RFC 6066 3: one more certificate and key, answered when the
+ * ClientHello's server_name matches `host`. One listener then serves
+ * several names.
+ *
+ * ktls_keys_server's own pair stays the default: it answers a client
+ * that names nothing, and a name none of the added pairs match. That is
+ * nginx's default_server answer, and it keeps a client that arrived by
+ * address served rather than told which names exist here.
+ *
+ * `host` is compared without regard to letter case, and one leading
+ * "*." matches exactly one label - "*.example.com" answers for
+ * "a.example.com" and not for "a.b.example.com" or "example.com".
+ *
+ * The suites and the ALPN list reach every pair, whichever order the
+ * calls come in. Call it once per name. The same name twice is refused.
+ * 0, or -1 with ktls_last_error saying why. */
+int ktls_keys_add_certificate(ktls_keys *keys, const char *host,
+                              const char *cert_pem, size_t cert_len,
+                              const char *key_pem, size_t key_len);
+
 /* Does this machine have the AES instructions? The default suite order
  * follows this answer; ktls_keys_set_ciphers overrides it with an
  * OpenSSL TLS 1.3 ciphersuite list. */

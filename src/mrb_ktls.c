@@ -63,6 +63,23 @@ static mrb_value keys_client(mrb_state *mrb, mrb_value klass)
   return mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(klass), k, &keys_type));
 }
 
+/* keys.add_certificate(host, cert_pem, key_pem) - RFC 6066 3. The pair
+ * KTLS::Keys.server was made with stays the default; this one answers a
+ * ClientHello whose server_name matches host. */
+static mrb_value keys_add_certificate(mrb_state *mrb, mrb_value self)
+{
+  const char *host;
+  char *cert, *key;
+  mrb_int certlen, keylen;
+  mrb_get_args(mrb, "zss", &host, &cert, &certlen, &key, &keylen);
+
+  if (ktls_keys_add_certificate(keys_of(mrb, self), host, cert, (size_t) certlen, key,
+                                (size_t) keylen) != 0) {
+    ktls_raise(mrb);
+  }
+  return mrb_str_new_cstr(mrb, host);
+}
+
 /* keys.alpn = ["h2", "http/1.1"] - order is preference. */
 static mrb_value keys_alpn_set(mrb_state *mrb, mrb_value self)
 {
@@ -305,6 +322,8 @@ void mrb_mruby_ktls_gem_init(mrb_state *mrb)
   mrb_undef_class_method_id(mrb, keys, MRB_SYM(new));
   mrb_define_class_method_id(mrb, keys, MRB_SYM(server), keys_server, MRB_ARGS_REQ(2));
   mrb_define_class_method_id(mrb, keys, MRB_SYM(client), keys_client, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, keys, MRB_SYM(add_certificate), keys_add_certificate,
+                       MRB_ARGS_REQ(3));
   mrb_define_method_id(mrb, keys, MRB_SYM_E(alpn), keys_alpn_set, MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, keys, MRB_SYM_E(ciphers), keys_ciphers_set, MRB_ARGS_REQ(1));
 
